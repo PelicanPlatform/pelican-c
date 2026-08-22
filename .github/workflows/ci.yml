@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-smoke:
+    name: Build & smoke (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Vet
+        run: |
+          test -z "$(gofmt -l .)"
+          go vet -tags=integration ./...
+
+      - name: Build library, examples, and integration driver
+        run: make example integration-client
+
+      - name: Offline smoke test
+        run: make test
+
+  # Launches a full in-process Pelican federation using the pure-Go
+  # serving paths (posixv2 origin, V2 cache), so no XRootD installation
+  # is needed, and drives the compiled C library against it.
+  integration:
+    name: Federation integration (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build integration driver
+        run: make integration-client
+
+      - name: Run federation integration test
+        run: make integration-test

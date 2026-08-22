@@ -55,6 +55,14 @@ This gives level-triggered semantics with no busy-wake: readable means
 consumer never reads the pipe directly and no async call ever blocks,
 which is exactly the contract a DaemonCore `Register_Pipe` handler needs.
 
+Progress callbacks follow the same discipline: in async mode they are
+never invoked from a Go thread. Reports queue on the transfer state
+(coalesced per object, so an unattended queue stays bounded) and wake
+the fd; `next_result` delivers them on the calling thread — with the
+mutex released, so a callback may safely call back into the library —
+before examining the result queue. The integration driver asserts this
+with `pthread_equal` on every callback.
+
 Lifetime safety: the Go goroutine holds the state object directly (not
 via the cgo handle), so `pelican_transfer_free` during a live transfer
 is safe — free marks the state, releases queued C memory, and closes the
@@ -117,6 +125,11 @@ point the shim can share the global engine across opens.
   to the request URL. Worth fixing upstream, at which point recursive
   downloads get accurate per-object sources.
 - `PelicanFS` lacks a shutdown/engine accessor (see above).
+- `launcher_utils.CheckDefaults` → `xrootd.CheckXrootdEnv` runs the
+  `xrootd -v` version gate even for servers on the pure-Go paths
+  (posixv2 origin, V2 cache) that never execute XRootD; the integration
+  test satisfies it with a stub script. Upstream fix: gate the check on
+  backends that actually launch XRootD.
 - The async path submits jobs through the raw `TransferEngine`, so it
   skips `DoGet`'s destination-layout conveniences (downloading into an
   existing directory, collection guards). Callers should pass explicit

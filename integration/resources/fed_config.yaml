@@ -1,0 +1,15 @@
+# Federation configuration for the pelican-c integration test.
+#
+# Uses the pure-Go serving paths — a "posixv2" origin (served in-process)
+# and the V2 persistent cache — so the test needs no XRootD binaries and
+# can run on stock CI runners.
+
+Origin:
+  StorageType: "posixv2"
+  Exports:
+    - StoragePrefix: /<SHOULD BE OVERRIDDEN>
+      FederationPrefix: /test-namespace
+      Capabilities: ["Reads", "Writes", "DirectReads", "Listings"]
+
+Cache:
+  EnableV2: true

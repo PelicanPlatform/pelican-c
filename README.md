@@ -18,10 +18,16 @@ functions, so struct layouts are never part of the ABI.
 Requires Go ≥ 1.26 and a C compiler.
 
 ```sh
-make            # builds build/libpelicanclient.{so,dylib}
-make example    # builds the example clients
-make test       # offline smoke test
+make                   # builds build/libpelicanclient.{so,dylib}
+make example           # builds the example clients
+make test              # offline smoke test
+make integration-test  # in-process federation test (no XRootD needed)
 ```
+
+CI runs the build/smoke matrix and the federation integration test —
+which launches a complete in-process Pelican federation using the
+pure-Go serving paths (posixv2 origin, V2 cache) and drives this
+library's C API against it — on Linux and macOS.
 
 ## Quick start (synchronous)
 
@@ -114,8 +120,11 @@ error taxonomy (e.g. 5011 for object-not-found).
 - Tokens can be passed per-operation (contents or file path) via
   `pelican_transfer_opts`; token discovery (e.g. `BEARER_TOKEN_FILE`,
   WLCG bearer-token conventions) otherwise applies.
-- Progress callbacks fire on library-owned threads; single-threaded
-  daemons should prefer the async API's notification fd.
+- In the async API, progress callbacks are never invoked from library
+  threads: they queue internally (waking the notification fd) and fire
+  on your own thread from inside `pelican_transfer_next_result` —
+  DaemonCore-safe.  Only the synchronous calls invoke callbacks from
+  library-owned threads, since the caller is blocked.
 - **Fork caution:** the Go runtime starts threads when the library is
   loaded. A `fork()` without `exec()` leaves the child's copy of the
   runtime unusable — load and use the library only in the process that

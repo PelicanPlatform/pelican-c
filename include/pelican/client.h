@@ -98,11 +98,19 @@ void pelican_context_free(pelican_context *ctx);
  * ------------------------------------------------------------------ */
 
 /**
- * Progress callback.  Invoked periodically during a transfer from a
- * library-owned thread (NOT the calling thread); it must be thread-safe
- * and must not call back into the library.  Event-loop applications
- * should usually prefer the asynchronous API's notification fd over
- * progress callbacks.
+ * Progress callback.  The invoking thread depends on the API used:
+ *
+ *  - Asynchronous transfers (pelican_get_start/pelican_put_start):
+ *    NEVER invoked from a library thread.  Progress reports queue
+ *    internally (waking the notification fd) and are delivered on the
+ *    host's own thread from inside pelican_transfer_next_result() —
+ *    safe for aggressively thread-unsafe hosts such as HTCondor
+ *    DaemonCore.  Reports are coalesced per object: the callback sees
+ *    each object's latest state, not every intermediate update.
+ *
+ *  - Synchronous calls (pelican_get/pelican_put): invoked periodically
+ *    from a library-owned thread while the caller blocks; the callback
+ *    must be thread-safe and must not call back into the library.
  *
  * object:      remote object path being transferred
  * transferred: bytes moved so far
@@ -208,10 +216,13 @@ pelican_error *pelican_put(pelican_context *ctx,
  *   1. pelican_get_start() / pelican_put_start() submits the transfer
  *      and returns immediately.
  *   2. Register pelican_transfer_notify_fd() for read events in your
- *      event loop.  The fd becomes readable whenever results are
- *      queued or the transfer finishes.  Do not read or close it.
+ *      event loop.  The fd becomes readable whenever results or
+ *      progress reports are queued or the transfer finishes.  Do not
+ *      read or close it.
  *   3. On wakeup, call pelican_transfer_next_result() until it returns
- *      0, freeing each popped result.
+ *      0, freeing each popped result.  Any pending progress callbacks
+ *      fire on your thread from inside next_result, before results are
+ *      reported.
  *   4. When pelican_transfer_is_done() reports completion, check
  *      pelican_transfer_error() for a transfer-level failure, then
  *      release everything with pelican_transfer_free().
@@ -248,6 +259,9 @@ int pelican_transfer_notify_fd(const pelican_transfer *xfer);
  * Returns 1 and stores an owned result in *res (free with
  * pelican_result_free), or 0 if none are pending — in which case the
  * notification fd is quiesced until new events arrive.
+ *
+ * If a progress callback was set, all pending progress reports are
+ * delivered on the calling thread before the result queue is examined.
  */
 int pelican_transfer_next_result(pelican_transfer *xfer,
                                  pelican_result **res);

@@ -120,10 +120,30 @@ type cancelContext struct {
 	cancel context.CancelFunc
 }
 
+// progressSink redirects progress reports away from direct C-callback
+// invocation.  The asynchronous API uses it to queue events for delivery
+// on the host's own thread — hosts like HTCondor DaemonCore are
+// aggressively thread-unsafe, so the library must never invoke their
+// callbacks from a Go-owned thread in that mode.
+type progressSink func(path string, downloaded, total int64, completed bool)
+
+// invokeProgress calls the C progress callback on the current thread.
+func invokeProgress(fn C.pelican_progress_fn, userData unsafe.Pointer, path string, downloaded, total int64, completed bool) {
+	cPath := C.CString(path)
+	cCompleted := C.int(0)
+	if completed {
+		cCompleted = 1
+	}
+	C.pelicanc_invoke_progress(fn, cPath, C.longlong(downloaded), C.longlong(total), cCompleted, userData)
+	C.free(unsafe.Pointer(cPath))
+}
+
 // buildOptions translates the C options struct into client.TransferOption
 // values.  The library always runs non-interactively: it must never block
-// the host process on an OAuth device-flow prompt.
-func buildOptions(copts *C.pelican_transfer_opts) (opts []client.TransferOption, recursive bool) {
+// the host process on an OAuth device-flow prompt.  If sink is non-nil,
+// progress reports are handed to it instead of invoking the C callback
+// from a library thread.
+func buildOptions(copts *C.pelican_transfer_opts, sink progressSink) (opts []client.TransferOption, recursive bool) {
 	opts = append(opts, client.WithNonInteractive(true))
 	if copts == nil {
 		return
@@ -138,15 +158,13 @@ func buildOptions(copts *C.pelican_transfer_opts) (opts []client.TransferOption,
 	if copts.progress != nil {
 		fn := copts.progress
 		userData := copts.progress_data
-		opts = append(opts, client.WithCallback(func(path string, downloaded int64, totalSize int64, completed bool) {
-			cPath := C.CString(path)
-			cCompleted := C.int(0)
-			if completed {
-				cCompleted = 1
-			}
-			C.pelicanc_invoke_progress(fn, cPath, C.longlong(downloaded), C.longlong(totalSize), cCompleted, userData)
-			C.free(unsafe.Pointer(cPath))
-		}))
+		cb := func(path string, downloaded int64, totalSize int64, completed bool) {
+			invokeProgress(fn, userData, path, downloaded, totalSize, completed)
+		}
+		if sink != nil {
+			cb = sink
+		}
+		opts = append(opts, client.WithCallback(cb))
 	}
 	return
 }
@@ -309,7 +327,7 @@ func pelicanc_get(cctx *C.pelican_context, remoteUrl, localPath *C.char, copts *
 		if err := requireInit(); err != nil {
 			return makeError(err)
 		}
-		opts, recursive := buildOptions(copts)
+		opts, recursive := buildOptions(copts, nil)
 		remote := C.GoString(remoteUrl)
 		results, err := client.DoGet(goCtxFor(cctx), remote, C.GoString(localPath), recursive, opts...)
 		if listOut != nil {
@@ -325,7 +343,7 @@ func pelicanc_put(cctx *C.pelican_context, localPath, remoteUrl *C.char, copts *
 		if err := requireInit(); err != nil {
 			return makeError(err)
 		}
-		opts, recursive := buildOptions(copts)
+		opts, recursive := buildOptions(copts, nil)
 		remote := C.GoString(remoteUrl)
 		results, err := client.DoPut(goCtxFor(cctx), C.GoString(localPath), remote, recursive, opts...)
 		if listOut != nil {
@@ -354,6 +372,22 @@ type transferState struct {
 	writeFd int
 	cancel  context.CancelFunc
 	tc      *client.TransferClient
+
+	// Progress callbacks are never invoked from library threads in
+	// async mode: events queue here (coalesced per object, since only
+	// the latest state matters) and are delivered on the host's thread
+	// from within pelican_transfer_next_result.
+	progressFn   C.pelican_progress_fn
+	progressData unsafe.Pointer
+	progressQ    []progressEvent
+	progressIdx  map[string]int
+}
+
+type progressEvent struct {
+	path       string
+	downloaded int64
+	total      int64
+	completed  bool
 }
 
 // wake writes one byte to the notification pipe.  Callers hold mu.  A
@@ -371,6 +405,49 @@ func (ts *transferState) drainPipe() {
 		n, err := syscall.Read(ts.readFd, buf)
 		if n <= 0 || err != nil {
 			return
+		}
+	}
+}
+
+// enqueueProgress records a progress report (from a Go thread) for later
+// delivery on the host's thread, coalescing by object so an unattended
+// queue stays bounded.
+func (ts *transferState) enqueueProgress(path string, downloaded, total int64, completed bool) {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	if ts.freed {
+		return
+	}
+	ev := progressEvent{path: path, downloaded: downloaded, total: total, completed: completed}
+	if ts.progressIdx == nil {
+		ts.progressIdx = make(map[string]int)
+	}
+	if i, ok := ts.progressIdx[path]; ok {
+		ts.progressQ[i] = ev
+	} else {
+		ts.progressIdx[path] = len(ts.progressQ)
+		ts.progressQ = append(ts.progressQ, ev)
+	}
+	ts.wake()
+}
+
+// deliverProgress invokes any queued progress callbacks on the calling
+// (host) thread.  The mutex is released during the invocations, so a
+// callback may safely call back into the library.
+func (ts *transferState) deliverProgress() {
+	for {
+		ts.mu.Lock()
+		if ts.freed || len(ts.progressQ) == 0 {
+			ts.mu.Unlock()
+			return
+		}
+		events := ts.progressQ
+		ts.progressQ = nil
+		ts.progressIdx = nil
+		fn, userData := ts.progressFn, ts.progressData
+		ts.mu.Unlock()
+		for _, e := range events {
+			invokeProgress(fn, userData, e.path, e.downloaded, e.total, e.completed)
 		}
 	}
 }
@@ -473,10 +550,16 @@ func startTransfer(remote, local string, upload bool, copts *C.pelican_transfer_
 		}
 		ctx, cancel := context.WithCancel(context.Background())
 		ts := &transferState{readFd: fds[0], writeFd: fds[1], cancel: cancel}
+		var sink progressSink
+		if copts != nil && copts.progress != nil {
+			ts.progressFn = copts.progress
+			ts.progressData = copts.progress_data
+			sink = ts.enqueueProgress
+		}
 		cxfer := C.pelicanc_transfer_alloc()
 		cxfer.handle = C.uintptr_t(cgo.NewHandle(ts))
 		cxfer.notify_fd = C.int(fds[0])
-		opts, recursive := buildOptions(copts)
+		opts, recursive := buildOptions(copts, sink)
 		go runTransfer(ctx, ts, te, remote, local, upload, recursive, opts)
 		*out = cxfer
 		return nil
@@ -496,6 +579,9 @@ func pelicanc_put_start(localPath, remoteUrl *C.char, copts *C.pelican_transfer_
 //export pelicanc_transfer_next_result
 func pelicanc_transfer_next_result(cxfer *C.pelican_transfer, res **C.pelican_result) C.int {
 	ts := transferStateFor(cxfer)
+	// Deliver pending progress callbacks on this (the host's) thread
+	// before reporting results.
+	ts.deliverProgress()
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
 	if len(ts.queue) > 0 {
@@ -597,7 +683,7 @@ func pelicanc_stat(cctx *C.pelican_context, remoteUrl *C.char, copts *C.pelican_
 			return makeError(fmt.Errorf("output file info pointer may not be NULL"))
 		}
 		*cinfo = nil
-		opts, _ := buildOptions(copts)
+		opts, _ := buildOptions(copts, nil)
 		info, err := client.DoStat(goCtxFor(cctx), C.GoString(remoteUrl), opts...)
 		if err != nil {
 			return makeError(err)
@@ -619,7 +705,7 @@ func pelicanc_list(cctx *C.pelican_context, remoteUrl *C.char, copts *C.pelican_
 			return makeError(fmt.Errorf("output list pointer may not be NULL"))
 		}
 		*listOut = nil
-		opts, _ := buildOptions(copts)
+		opts, _ := buildOptions(copts, nil)
 		infos, err := client.DoList(goCtxFor(cctx), C.GoString(remoteUrl), opts...)
 		if err != nil {
 			return makeError(err)
@@ -644,7 +730,7 @@ func pelicanc_delete(cctx *C.pelican_context, remoteUrl *C.char, copts *C.pelica
 		if err := requireInit(); err != nil {
 			return makeError(err)
 		}
-		opts, recursive := buildOptions(copts)
+		opts, recursive := buildOptions(copts, nil)
 		return makeError(client.DoDelete(goCtxFor(cctx), C.GoString(remoteUrl), recursive, opts...))
 	})
 }
@@ -710,7 +796,7 @@ func pelicanc_fs_open(remoteUrl *C.char, flags C.int, copts *C.pelican_transfer_
 		if u.Scheme == "" || u.Host == "" {
 			return makeError(fmt.Errorf("remote URL %q must include a scheme and federation host (e.g. pelican://federation/path)", u.String()))
 		}
-		opts, _ := buildOptions(copts)
+		opts, _ := buildOptions(copts, nil)
 		ctx, cancel := context.WithCancel(context.Background())
 		pfs := client.NewPelicanFSWithPrefix(ctx, u.Scheme+"://"+u.Host, opts...)
 		f, err := pfs.OpenFile(u.Path, goFlags)

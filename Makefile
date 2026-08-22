@@ -14,10 +14,11 @@ BUILDDIR := build
 LIB      := $(BUILDDIR)/libpelicanclient.$(SOEXT)
 EXAMPLE  := $(BUILDDIR)/pelican_example
 ASYNC_EXAMPLE := $(BUILDDIR)/pelican_async_example
+INTEGRATION_CLIENT := $(BUILDDIR)/integration_client
 
 GO_SOURCES := $(wildcard *.go) bridge.c bridge.h include/pelican/client.h go.mod go.sum
 
-.PHONY: all example test clean
+.PHONY: all example integration-client integration-test test clean
 
 all: $(LIB)
 
@@ -41,9 +42,21 @@ $(ASYNC_EXAMPLE): $(LIB) examples/pelican_async_example.c
 	$(CC) -Wall -Wextra -o $@ examples/pelican_async_example.c -Iinclude \
 	    -L$(BUILDDIR) -lpelicanclient -Wl,-rpath,$(abspath $(BUILDDIR))
 
+integration-client: $(INTEGRATION_CLIENT)
+
+$(INTEGRATION_CLIENT): $(LIB) tests/integration_client.c
+	$(CC) -Wall -Wextra -o $@ tests/integration_client.c -Iinclude \
+	    -L$(BUILDDIR) -lpelicanclient -Wl,-rpath,$(abspath $(BUILDDIR)) \
+	    -lpthread
+
 # Offline smoke test: version string, init, and an error-path check.
 test: $(EXAMPLE) $(ASYNC_EXAMPLE)
 	./$(EXAMPLE)
+
+# Federation integration test: launches an in-process Pelican federation
+# (requires XRootD binaries on PATH) and drives the C library against it.
+integration-test: $(INTEGRATION_CLIENT)
+	go test -tags=integration -count=1 -timeout=20m -v ./integration
 
 clean:
 	rm -rf $(BUILDDIR)
