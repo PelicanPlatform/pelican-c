@@ -15,6 +15,7 @@
  *   integration_client stat-async    <url>
  *   integration_client list-async    <url>
  *   integration_client fs-read-async <url>
+ *   integration_client logged-get    <url> <local-path>
  *
  * Trailing [opt...] arguments for get: "checksum=<digest>",
  * "cache=<url>", "require-checksum".
@@ -463,6 +464,124 @@ cmd_fs_read_async(const char *url)
     return busy_rejected ? 0 : 1;
 }
 
+/* State for the queued-logging check. */
+static pthread_t log_pump_thread;
+static int log_records;
+static int log_off_thread;
+static int log_levels_seen[PELICAN_LOG_TRACE + 1];
+
+static void
+log_sink(pelican_log_level level, const char *message, void *user_data)
+{
+    (void)user_data;
+    log_records++;
+    if (level >= PELICAN_LOG_ERROR && level <= PELICAN_LOG_TRACE)
+        log_levels_seen[level]++;
+    if (!pthread_equal(pthread_self(), log_pump_thread))
+        log_off_thread++;
+    /* Stand-in for a host logging subsystem (e.g. condor's dprintf). */
+    fprintf(stderr, "[pelican:%d] %s\n", (int)level, message);
+}
+
+/* Run a transfer with the client's log output routed into a host
+ * callback, verifying that queued records are delivered only from
+ * pelican_log_pump() on the pumping thread. */
+static int
+cmd_logged_get(const char *url, const char *local_path)
+{
+    pelican_error *err;
+
+    log_pump_thread = pthread_self();
+
+    if ((err = pelican_log_set_callback(log_sink, NULL, PELICAN_LOG_QUEUED)) != NULL)
+        return fail("log_set_callback", err);
+    if ((err = pelican_log_set_level(PELICAN_LOG_DEBUG)) != NULL)
+        return fail("log_set_level", err);
+
+    int fd = pelican_log_notify_fd();
+    if (fd < 0) {
+        fprintf(stderr, "queued logging did not provide a notification fd\n");
+        return 1;
+    }
+
+    /* Nothing may be delivered while the transfer runs: records only
+     * reach the callback from pump(), below. */
+    pelican_transfer *xfer = NULL;
+    if ((err = pelican_get_start(url, local_path, NULL, &xfer)) != NULL)
+        return fail("get_start", err);
+
+    struct pollfd pfds[2];
+    pfds[0].fd = pelican_transfer_notify_fd(xfer);
+    pfds[0].events = POLLIN;
+    pfds[1].fd = fd;
+    pfds[1].events = POLLIN;
+
+    int failures = 0;
+    for (;;) {
+        if (poll(pfds, 2, -1) < 0) {
+            perror("poll");
+            pelican_transfer_free(xfer);
+            return 1;
+        }
+        /* A real daemon would dispatch these as two independent fd
+         * handlers; both run on this thread. */
+        pelican_log_pump();
+
+        pelican_result *res;
+        while (pelican_transfer_next_result(xfer, &res)) {
+            const pelican_error *rerr = pelican_result_error(res);
+            if (rerr != NULL) {
+                fprintf(stderr, "object %s failed: %s\n",
+                        pelican_result_source(res),
+                        pelican_error_message(rerr));
+                failures++;
+            } else {
+                printf("object=%s bytes=%lld\n",
+                       pelican_result_source(res),
+                       pelican_result_transferred_bytes(res));
+            }
+            pelican_result_free(res);
+        }
+        if (pelican_transfer_is_done(xfer))
+            break;
+    }
+
+    const pelican_error *terr = pelican_transfer_error(xfer);
+    if (terr != NULL) {
+        fprintf(stderr, "transfer failed: %s\n",
+                pelican_error_message(terr));
+        failures++;
+    }
+    pelican_transfer_free(xfer);
+
+    /* Collect anything logged during teardown. */
+    pelican_log_pump();
+
+    /* Uninstalling must stop delivery; records logged afterward are
+     * discarded rather than queued forever. */
+    if ((err = pelican_log_set_callback(NULL, NULL, PELICAN_LOG_QUEUED)) != NULL)
+        return fail("log_set_callback(NULL)", err);
+    if (pelican_log_notify_fd() >= 0) {
+        fprintf(stderr, "notification fd survived callback removal\n");
+        failures++;
+    }
+
+    printf("log_records=%d\nlog_off_thread=%d\nlog_debug_records=%d\n",
+           log_records, log_off_thread, log_levels_seen[PELICAN_LOG_DEBUG]);
+    if (log_off_thread > 0) {
+        fprintf(stderr,
+                "THREADING VIOLATION: %d log record(s) were delivered off "
+                "the pumping thread\n",
+                log_off_thread);
+        failures++;
+    }
+    if (log_records == 0) {
+        fprintf(stderr, "no log records were delivered\n");
+        failures++;
+    }
+    return failures ? 1 : 0;
+}
+
 static int
 cmd_delete(const char *url)
 {
@@ -508,6 +627,8 @@ main(int argc, char **argv)
         return cmd_list_async(argv[2]);
     if (strcmp(cmd, "fs-read-async") == 0)
         return cmd_fs_read_async(argv[2]);
+    if (strcmp(cmd, "logged-get") == 0 && argc >= 4)
+        return cmd_logged_get(argv[2], argv[3]);
 
     fprintf(stderr, "unknown subcommand: %s\n", cmd);
     return 2;

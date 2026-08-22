@@ -296,6 +296,25 @@ func TestCClientFederation(t *testing.T) {
 		assert.Contains(t, stderr, fmt.Sprintf("fs_read_bytes=%d", len(helloContent)))
 	})
 
+	// Log records must reach the host's logging subsystem, and in queued
+	// mode must be delivered only from pelican_log_pump() on the calling
+	// thread — the same constraint DaemonCore imposes on callbacks.
+	t.Run("host-logging", func(t *testing.T) {
+		dest := filepath.Join(downloads, "logged.txt")
+		stdout, stderr, code := runDriver(t, driver, env, "logged-get", objectUrl("hello_world.txt"), dest)
+		require.Equal(t, 0, code)
+		assert.Contains(t, stdout, fmt.Sprintf("bytes=%d", len(helloContent)))
+		assert.Contains(t, stdout, "log_off_thread=0")
+		assert.NotContains(t, stdout, "log_records=0\n")
+		// The callback saw real client log output, tagged with a level.
+		assert.Contains(t, stderr, "[pelican:")
+		// Level filtering reached debug records.
+		assert.NotContains(t, stdout, "log_debug_records=0\n")
+		content, err := os.ReadFile(dest)
+		require.NoError(t, err)
+		assert.Equal(t, helloContent, string(content))
+	})
+
 	t.Run("list", func(t *testing.T) {
 		stdout, _, code := runDriver(t, driver, env, "list", objectUrl("/"))
 		require.Equal(t, 0, code)

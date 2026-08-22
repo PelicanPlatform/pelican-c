@@ -31,6 +31,13 @@ pelicanc_invoke_progress(pelican_progress_fn fn, const char *object,
     fn(object, transferred, total, completed, user_data);
 }
 
+void
+pelicanc_invoke_log(pelican_log_fn fn, int level, const char *message,
+                    void *user_data)
+{
+    fn((pelican_log_level)level, message, user_data);
+}
+
 pelican_error *
 pelicanc_error_alloc(void)
 {
@@ -573,6 +580,31 @@ const char *
 pelican_version(void)
 {
     return pelicanc_version();
+}
+
+pelican_error *
+pelican_log_set_callback(pelican_log_fn fn, void *user_data,
+                         pelican_log_delivery delivery)
+{
+    return pelicanc_log_set_callback(fn, user_data, (int)delivery);
+}
+
+int
+pelican_log_notify_fd(void)
+{
+    return pelicanc_log_notify_fd();
+}
+
+size_t
+pelican_log_pump(void)
+{
+    return pelicanc_log_pump();
+}
+
+pelican_error *
+pelican_log_set_level(pelican_log_level level)
+{
+    return pelicanc_log_set_level((int)level);
 }
 
 pelican_context *

@@ -4,6 +4,7 @@ go 1.26.0
 
 require (
 	github.com/pelicanplatform/pelican v0.0.0-20260821221920-8eb895fdf9b3
+	github.com/sirupsen/logrus v1.9.3
 	github.com/spf13/viper v1.20.0-alpha.3
 	github.com/stretchr/testify v1.11.1
 )
@@ -204,7 +205,6 @@ require (
 	github.com/segmentio/asm v1.2.0 // indirect
 	github.com/sethvargo/go-retry v0.2.4 // indirect
 	github.com/shurcooL/httpfs v0.0.0-20230704072500-f1e31cf0ba5c // indirect
-	github.com/sirupsen/logrus v1.9.3 // indirect
 	github.com/sourcegraph/conc v0.3.0 // indirect
 	github.com/spf13/afero v1.12.0 // indirect
 	github.com/spf13/cast v1.6.0 // indirect

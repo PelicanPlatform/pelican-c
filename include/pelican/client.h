@@ -91,6 +91,87 @@ pelican_error *pelican_client_init(const char *config_file);
 const char *pelican_version(void);
 
 /* ------------------------------------------------------------------ *
+ * Logging                                                            *
+ * ------------------------------------------------------------------ */
+
+/**
+ * Severity of a log record, mapped from the Go client's levels: its
+ * panic, fatal, and error levels all arrive as PELICAN_LOG_ERROR.
+ */
+typedef enum {
+    PELICAN_LOG_ERROR = 0,
+    PELICAN_LOG_WARNING,
+    PELICAN_LOG_INFO,
+    PELICAN_LOG_DEBUG,
+    PELICAN_LOG_TRACE
+} pelican_log_level;
+
+/**
+ * Receives one log record.  `message` is borrowed for the duration of
+ * the call: copy it if you need to keep it.  Any structured fields the
+ * library attached are appended as ` key=value` pairs.
+ */
+typedef void (*pelican_log_fn)(pelican_log_level level, const char *message,
+                               void *user_data);
+
+/** How log records reach the callback. */
+typedef enum {
+    /**
+     * Records queue internally and are delivered only from
+     * pelican_log_pump(), on the thread that calls it.  Nothing is
+     * invoked from a library thread — the right choice for
+     * aggressively thread-unsafe hosts such as HTCondor DaemonCore.
+     */
+    PELICAN_LOG_QUEUED = 0,
+    /**
+     * Records are delivered immediately, from whichever library thread
+     * produced them.  The callback must be thread-safe and must not
+     * call back into the library.
+     */
+    PELICAN_LOG_DIRECT = 1
+} pelican_log_delivery;
+
+/**
+ * Route the client's log output to `fn`, replacing any previous
+ * callback, and stop the library writing to stderr or a configured log
+ * file.  Passing NULL uninstalls the callback and restores the
+ * library's own stderr output.
+ *
+ * Call this AFTER pelican_client_init(): initialization applies the
+ * logging configuration and would otherwise reinstate the library's own
+ * output.
+ *
+ * With PELICAN_LOG_QUEUED, records accumulate in a bounded queue; if the
+ * host stops pumping, the oldest records are dropped and the next
+ * delivery reports how many were lost, so a log storm cannot grow
+ * memory without bound.
+ */
+pelican_error *pelican_log_set_callback(pelican_log_fn fn, void *user_data,
+                                        pelican_log_delivery delivery);
+
+/**
+ * Readable while queued records await delivery, for hosts that wait on
+ * descriptors.  Returns -1 if no queued callback is installed.  Owned
+ * by the library: do not read from or close it.  It quiesces once
+ * pelican_log_pump() has drained the queue.
+ */
+int pelican_log_notify_fd(void);
+
+/**
+ * Deliver all pending log records on the calling thread, in the order
+ * produced, and return how many callbacks were invoked.  Safe to call
+ * at any time; a no-op when the queue is empty or delivery is direct.
+ */
+size_t pelican_log_pump(void);
+
+/**
+ * Set the minimum severity the library emits.  Records below this level
+ * are never generated, so raising the threshold costs nothing at the
+ * call site.
+ */
+pelican_error *pelican_log_set_level(pelican_log_level level);
+
+/* ------------------------------------------------------------------ *
  * Cancellation contexts (for the synchronous calls)                  *
  * ------------------------------------------------------------------ */
 

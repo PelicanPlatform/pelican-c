@@ -54,14 +54,18 @@ CLIENT_LDFLAGS := -L$(BUILDDIR) -lpelicanclient -Wl,-rpath,$(abspath $(BUILDDIR)
 
 .PHONY: all example integration-client integration-test test install uninstall clean print-abi-version FORCE
 
+# Set explicitly: the phony helpers below would otherwise make whichever
+# rule happens to appear first the default goal.
+.DEFAULT_GOAL := all
+
+all: $(LIB) $(LINK) $(PCFILE)
+
 FORCE:
 
 # Consumed by scripts/package-release.sh so the ABI version lives in one
 # place.
 print-abi-version:
 	@echo $(ABI_VERSION)
-
-all: $(LIB) $(LINK) $(PCFILE)
 
 $(LIB): $(GO_SOURCES)
 	mkdir -p $(BUILDDIR)

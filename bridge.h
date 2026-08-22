@@ -92,10 +92,12 @@ struct pelican_file_info_list {
     size_t              count;
 };
 
-/* Trampoline so Go code can invoke a C function pointer. */
+/* Trampolines so Go code can invoke C function pointers. */
 void pelicanc_invoke_progress(pelican_progress_fn fn, const char *object,
                               long long transferred, long long total,
                               int completed, void *user_data);
+void pelicanc_invoke_log(pelican_log_fn fn, int level, const char *message,
+                         void *user_data);
 
 /* calloc-based allocators so Go hands out C-owned memory. */
 pelican_error *pelicanc_error_alloc(void);

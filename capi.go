@@ -43,6 +43,8 @@ import (
 	"os"
 	"runtime/cgo"
 	"runtime/debug"
+	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -51,6 +53,7 @@ import (
 	"github.com/pelicanplatform/pelican/client"
 	"github.com/pelicanplatform/pelican/config"
 	"github.com/pelicanplatform/pelican/error_codes"
+	log "github.com/sirupsen/logrus"
 	"github.com/spf13/viper"
 )
 
@@ -342,6 +345,228 @@ func pelicanc_version() *C.char {
 		versionCStr = C.CString(config.GetVersion())
 	})
 	return versionCStr
+}
+
+/* ------------------------------------------------------------------ *
+ * Logging                                                            *
+ * ------------------------------------------------------------------ */
+
+// maxQueuedLogs bounds the queue used by PELICAN_LOG_QUEUED delivery.  A
+// host that stops pumping (or a sudden log storm) must not be able to
+// grow memory without limit, so the oldest records are dropped and
+// counted instead.
+const maxQueuedLogs = 8192
+
+type logRecord struct {
+	level   C.int
+	message string
+}
+
+// logState holds the host's log callback and the queue feeding it.
+type logState struct {
+	mu       sync.Mutex
+	fn       C.pelican_log_fn
+	userData unsafe.Pointer
+	direct   bool
+	queue    []logRecord
+	dropped  uint64
+	pipe     notifyPipe
+	hasPipe  bool
+}
+
+var logs logState
+
+// hookOnce guards installation of the logrus hook: it stays registered
+// for the process lifetime, and swapping callbacks only retargets it.
+var hookOnce sync.Once
+
+// levelFor maps a logrus level onto the public enum.  Panic, fatal, and
+// error all surface as PELICAN_LOG_ERROR: a host cares that the record
+// is an error, and the library never actually exits the process.
+func levelFor(level log.Level) C.int {
+	switch level {
+	case log.PanicLevel, log.FatalLevel, log.ErrorLevel:
+		return C.PELICAN_LOG_ERROR
+	case log.WarnLevel:
+		return C.PELICAN_LOG_WARNING
+	case log.InfoLevel:
+		return C.PELICAN_LOG_INFO
+	case log.DebugLevel:
+		return C.PELICAN_LOG_DEBUG
+	default:
+		return C.PELICAN_LOG_TRACE
+	}
+}
+
+// logrusLevelFor maps the public enum onto a logrus level.
+func logrusLevelFor(level C.int) (log.Level, error) {
+	switch level {
+	case C.PELICAN_LOG_ERROR:
+		return log.ErrorLevel, nil
+	case C.PELICAN_LOG_WARNING:
+		return log.WarnLevel, nil
+	case C.PELICAN_LOG_INFO:
+		return log.InfoLevel, nil
+	case C.PELICAN_LOG_DEBUG:
+		return log.DebugLevel, nil
+	case C.PELICAN_LOG_TRACE:
+		return log.TraceLevel, nil
+	}
+	return log.InfoLevel, fmt.Errorf("invalid log level %d", int(level))
+}
+
+// hostLogHook forwards logrus records to the host's callback.  logrus
+// fires hooks without holding its own lock, so this may take the log
+// state mutex safely; it must not log, which would recurse.
+type hostLogHook struct{}
+
+func (hostLogHook) Levels() []log.Level { return log.AllLevels }
+
+func (hostLogHook) Fire(entry *log.Entry) error {
+	var sb strings.Builder
+	sb.WriteString(entry.Message)
+	if len(entry.Data) > 0 {
+		keys := make([]string, 0, len(entry.Data))
+		for k := range entry.Data {
+			keys = append(keys, k)
+		}
+		// Sorted so a record's rendering is stable run to run.
+		sort.Strings(keys)
+		for _, k := range keys {
+			fmt.Fprintf(&sb, " %s=%v", k, entry.Data[k])
+		}
+	}
+	logs.emit(levelFor(entry.Level), sb.String())
+	return nil
+}
+
+// emit delivers a record directly or queues it, depending on the mode
+// the host selected.
+func (ls *logState) emit(level C.int, message string) {
+	ls.mu.Lock()
+	if ls.fn == nil {
+		ls.mu.Unlock()
+		return
+	}
+	if ls.direct {
+		fn, userData := ls.fn, ls.userData
+		ls.mu.Unlock()
+		invokeLog(fn, userData, level, message)
+		return
+	}
+	if len(ls.queue) >= maxQueuedLogs {
+		// Drop the oldest: under a storm the most recent records are the
+		// ones a host needs to see.
+		ls.queue = ls.queue[1:]
+		ls.dropped++
+	}
+	ls.queue = append(ls.queue, logRecord{level: level, message: message})
+	if ls.hasPipe {
+		ls.pipe.wake()
+	}
+	ls.mu.Unlock()
+}
+
+// invokeLog calls the host's callback on the current thread.
+func invokeLog(fn C.pelican_log_fn, userData unsafe.Pointer, level C.int, message string) {
+	cMsg := C.CString(message)
+	C.pelicanc_invoke_log(fn, level, cMsg, userData)
+	C.free(unsafe.Pointer(cMsg))
+}
+
+//export pelicanc_log_set_callback
+func pelicanc_log_set_callback(fn C.pelican_log_fn, userData unsafe.Pointer, delivery C.int) *C.pelican_error {
+	return guard(func() *C.pelican_error {
+		if delivery != C.PELICAN_LOG_QUEUED && delivery != C.PELICAN_LOG_DIRECT {
+			return makeError(fmt.Errorf("invalid log delivery mode %d", int(delivery)))
+		}
+		logs.mu.Lock()
+		logs.fn = fn
+		logs.userData = userData
+		logs.direct = delivery == C.PELICAN_LOG_DIRECT
+		if fn == nil {
+			// Uninstalled: drop anything queued, since nothing will
+			// collect it.
+			logs.queue = nil
+			logs.dropped = 0
+		} else if !logs.direct && !logs.hasPipe {
+			pipe, err := newNotifyPipe()
+			if err != nil {
+				logs.mu.Unlock()
+				return makeError(err)
+			}
+			logs.pipe = pipe
+			logs.hasPipe = true
+		}
+		logs.mu.Unlock()
+
+		if fn == nil {
+			// Restore the library's own output.
+			log.SetOutput(os.Stderr)
+			return nil
+		}
+		hookOnce.Do(func() { log.AddHook(hostLogHook{}) })
+		// The host owns log output now; writing to stderr (or a
+		// configured log file) as well would duplicate every record.
+		log.SetOutput(io.Discard)
+		return nil
+	})
+}
+
+//export pelicanc_log_notify_fd
+func pelicanc_log_notify_fd() C.int {
+	logs.mu.Lock()
+	defer logs.mu.Unlock()
+	if !logs.hasPipe || logs.fn == nil || logs.direct {
+		return -1
+	}
+	return C.int(logs.pipe.readFd)
+}
+
+//export pelicanc_log_pump
+func pelicanc_log_pump() C.size_t {
+	var delivered C.size_t
+	for {
+		logs.mu.Lock()
+		if logs.fn == nil || logs.direct || len(logs.queue) == 0 {
+			// Quiesce the notification fd now that nothing is pending.
+			if logs.hasPipe {
+				logs.pipe.drain()
+			}
+			logs.mu.Unlock()
+			return delivered
+		}
+		batch := logs.queue
+		logs.queue = nil
+		dropped := logs.dropped
+		logs.dropped = 0
+		fn, userData := logs.fn, logs.userData
+		logs.mu.Unlock()
+
+		// Invoked with the lock released, so a callback may log or call
+		// back into the library without deadlocking.
+		if dropped > 0 {
+			invokeLog(fn, userData, C.PELICAN_LOG_WARNING,
+				fmt.Sprintf("pelican-c: dropped %d log record(s); the log queue overflowed", dropped))
+			delivered++
+		}
+		for _, rec := range batch {
+			invokeLog(fn, userData, rec.level, rec.message)
+			delivered++
+		}
+	}
+}
+
+//export pelicanc_log_set_level
+func pelicanc_log_set_level(level C.int) *C.pelican_error {
+	return guard(func() *C.pelican_error {
+		goLevel, err := logrusLevelFor(level)
+		if err != nil {
+			return makeError(err)
+		}
+		log.SetLevel(goLevel)
+		return nil
+	})
 }
 
 /* ------------------------------------------------------------------ *

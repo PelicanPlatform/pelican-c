@@ -69,6 +69,31 @@ is safe — free marks the state, releases queued C memory, and closes the
 pipe under the mutex; subsequent producer events free their payload
 immediately instead of enqueueing, and never touch the closed fds.
 
+## Logging
+
+Log output is intercepted with a logrus hook on the standard logger —
+the same mechanism upstream uses for its own buffered hook — plus
+`log.SetOutput(io.Discard)` so records are not also written to stderr or
+a configured log file. logrus copies its hook list under lock and fires
+hooks *outside* that lock, so the hook may take the log mutex safely; it
+must never log, which would recurse.
+
+Delivery follows the progress-callback precedent: records are produced on
+arbitrary library goroutines, so queued mode (the default) hands them to
+the host only from `pelican_log_pump()`, on the caller's thread. Unlike
+progress reports, logs cannot be coalesced — every line is distinct — so
+the queue is bounded at `maxQueuedLogs` and overflow drops the *oldest*
+records, on the grounds that a host debugging a live daemon wants the
+most recent activity; the count of dropped records is reported as a
+synthesized warning on the next delivery. Callbacks are invoked with the
+log mutex released, so a callback may re-enter the library.
+
+Ordering constraint worth knowing: `config.InitClient` calls
+`logging.FlushLogs`, which reinstates the library's own output, so a
+callback must be installed after initialization. The remaining
+`FlushLogs` call sites are all in `InitServer`, which this library never
+reaches, so nothing later in the client path disturbs the redirection.
+
 ## Single-shot asynchronous operations
 
 Everything that is not a multi-object transfer — the namespace calls,

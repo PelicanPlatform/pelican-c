@@ -100,6 +100,37 @@ if (pelican_transfer_is_done(xfer)) {
 }
 ```
 
+## Routing logs into the host's logging subsystem
+
+The client's log output can be handed to the host — HTCondor's
+`dprintf`, say — instead of going to stderr or a log file:
+
+```c
+static void to_dprintf(pelican_log_level level, const char *message, void *ud)
+{
+    dprintf(level <= PELICAN_LOG_WARNING ? D_ALWAYS : D_FULLDEBUG,
+            "pelican: %s\n", message);
+}
+
+pelican_log_set_callback(to_dprintf, NULL, PELICAN_LOG_QUEUED);
+pelican_log_set_level(PELICAN_LOG_INFO);
+register_fd(pelican_log_notify_fd());   /* readable when records wait */
+
+/* fd handler, or anywhere in the loop: */
+pelican_log_pump();                     /* delivers on THIS thread */
+```
+
+Log records originate on library threads, so `PELICAN_LOG_QUEUED`
+(the DaemonCore-safe default) queues them and delivers them only from
+`pelican_log_pump()`, on the thread that calls it.  The queue is
+bounded: if a host stops pumping, the oldest records are dropped and the
+next delivery reports how many were lost.  `PELICAN_LOG_DIRECT` skips
+the queue for hosts whose logger is thread-safe.
+
+Install the callback *after* `pelican_client_init()`, which applies the
+logging configuration; installing it suppresses the library's own stderr
+and log-file output, and passing NULL restores it.
+
 ## Asynchronous namespace operations and file I/O
 
 Everything else has a non-blocking form too, built on a single-shot
@@ -160,6 +191,7 @@ notification-fd protocol, and API conventions.
 | Async operations | `pelican_stat_start`, `pelican_list_start`, `pelican_delete_start`, `pelican_cache_info_start`, `pelican_evict_start`, `pelican_fs_open_start`, `pelican_file_read_start/_pread_start/_write_start/_close_start` |
 | Operation handles | `pelican_op_notify_fd`, `..._is_done`, `..._error`, `..._cancel`, `..._free`, `..._take_file_info/_file_info_list/_file/_count/_data/_cache_info/_message` |
 | Errors | `pelican_error_message`, `..._is_retryable`, `..._code`, `..._free` |
+| Logging | `pelican_log_set_callback`, `pelican_log_notify_fd`, `pelican_log_pump`, `pelican_log_set_level` |
 
 Every fallible call returns a `pelican_error *` (NULL on success) carrying
 a human-readable message, a `retryable` flag derived from the client's
