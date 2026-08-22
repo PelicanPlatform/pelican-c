@@ -34,6 +34,7 @@ import "C"
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -154,6 +155,18 @@ func buildOptions(copts *C.pelican_transfer_opts, sink progressSink) (opts []cli
 	if copts.token_location != nil {
 		opts = append(opts, client.WithTokenLocation(C.GoString(copts.token_location)))
 	}
+	if copts.source_token != nil {
+		opts = append(opts, client.WithSourceToken(C.GoString(copts.source_token)))
+	}
+	if copts.source_token_location != nil {
+		opts = append(opts, client.WithSourceTokenLocation(C.GoString(copts.source_token_location)))
+	}
+	if copts.dest_token != nil {
+		opts = append(opts, client.WithDestinationToken(C.GoString(copts.dest_token)))
+	}
+	if copts.dest_token_location != nil {
+		opts = append(opts, client.WithDestinationTokenLocation(C.GoString(copts.dest_token_location)))
+	}
 	recursive = copts.recursive != 0
 	if copts.progress != nil {
 		fn := copts.progress
@@ -211,6 +224,23 @@ func makeCResult(r *client.TransferResults, fallbackSource string) *C.pelican_re
 		last := r.Attempts[n-1]
 		res.endpoint = C.CString(last.Endpoint)
 		res.transfer_time_s = C.double(last.TransferTime.Seconds())
+	}
+	if r.ETag != "" {
+		res.etag = C.CString(r.ETag)
+	}
+	checksums := r.ServerChecksums
+	if len(checksums) == 0 {
+		checksums = r.ClientChecksums
+	}
+	if len(checksums) > 0 {
+		arr := C.pelicanc_checksum_alloc(C.size_t(len(checksums)))
+		slice := unsafe.Slice(arr, len(checksums))
+		for i, ck := range checksums {
+			slice[i]._type = C.CString(client.HttpDigestFromChecksum(ck.Algorithm))
+			slice[i].value = C.CString(hex.EncodeToString(ck.Value))
+		}
+		res.checksums = arr
+		res.n_checksums = C.size_t(len(checksums))
 	}
 	res.error = makeError(r.Error)
 	return res
@@ -478,20 +508,57 @@ func transferStateFor(cxfer *C.pelican_transfer) *transferState {
 	return cgo.Handle(cxfer.handle).Value().(*transferState)
 }
 
+// xferKind selects which engine job an async or engine-backed sync
+// operation creates.
+type xferKind int
+
+const (
+	kindGet xferKind = iota
+	kindPut
+	kindCopy
+	kindPrestage
+)
+
+// makeJob builds the engine job for the given kind.  For get/put, a is
+// the remote URL and b the local path; for copy, a is the source URL and
+// b the destination URL; for prestage, a is the remote URL.
+func makeJob(ctx context.Context, tc *client.TransferClient, kind xferKind, a, b string, recursive bool, opts []client.TransferOption) (*client.TransferJob, error) {
+	switch kind {
+	case kindGet, kindPut:
+		pUrl, err := client.ParseRemoteAsPUrl(ctx, a)
+		if err != nil {
+			return nil, err
+		}
+		return tc.NewTransferJob(ctx, pUrl.GetRawUrl(), b, kind == kindPut, recursive, opts...)
+	case kindCopy:
+		srcUrl, err := url.Parse(a)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse copy source URL: %w", err)
+		}
+		destUrl, err := url.Parse(b)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse copy destination URL: %w", err)
+		}
+		return tc.NewCopyJob(ctx, srcUrl, destUrl, recursive, opts...)
+	case kindPrestage:
+		pUrl, err := client.ParseRemoteAsPUrl(ctx, a)
+		if err != nil {
+			return nil, err
+		}
+		return tc.NewPrestageJob(ctx, pUrl.GetRawUrl(), opts...)
+	}
+	return nil, fmt.Errorf("unknown transfer kind %d", kind)
+}
+
 // runTransfer is the goroutine driving one asynchronous transfer,
 // streaming per-object results into the state as the engine produces
 // them.
-func runTransfer(ctx context.Context, ts *transferState, te *client.TransferEngine, remote, local string, upload, recursive bool, opts []client.TransferOption) {
+func runTransfer(ctx context.Context, ts *transferState, te *client.TransferEngine, kind xferKind, a, b string, recursive bool, opts []client.TransferOption) {
 	defer func() {
 		if r := recover(); r != nil {
 			ts.finish(fmt.Errorf("panic in pelican transfer: %v", r))
 		}
 	}()
-	pUrl, err := client.ParseRemoteAsPUrl(ctx, remote)
-	if err != nil {
-		ts.finish(err)
-		return
-	}
 	tc, err := te.NewClient(opts...)
 	if err != nil {
 		ts.finish(err)
@@ -505,7 +572,7 @@ func runTransfer(ctx context.Context, ts *transferState, te *client.TransferEngi
 	}
 	ts.tc = tc
 	ts.mu.Unlock()
-	tj, err := tc.NewTransferJob(ctx, pUrl.GetRawUrl(), local, upload, recursive, opts...)
+	tj, err := makeJob(ctx, tc, kind, a, b, recursive, opts)
 	if err != nil {
 		tc.Close()
 		ts.finish(err)
@@ -518,7 +585,7 @@ func runTransfer(ctx context.Context, ts *transferState, te *client.TransferEngi
 	}
 	tc.Close()
 	for r := range tc.Results() {
-		ts.enqueue(makeCResult(&r, remote))
+		ts.enqueue(makeCResult(&r, a))
 	}
 	_, lookupErr := tj.GetLookupStatus()
 	if lookupErr == nil {
@@ -527,7 +594,53 @@ func runTransfer(ctx context.Context, ts *transferState, te *client.TransferEngi
 	ts.finish(lookupErr)
 }
 
-func startTransfer(remote, local string, upload bool, copts *C.pelican_transfer_opts, out **C.pelican_transfer) *C.pelican_error {
+// runSyncEngineJob runs one engine-backed job to completion, blocking the
+// caller.  Backs the synchronous copy and prestage entry points, which
+// have no client.Do* convenience wrapper.
+func runSyncEngineJob(cctx *C.pelican_context, kind xferKind, a, b string, copts *C.pelican_transfer_opts, listOut **C.pelican_result_list) *C.pelican_error {
+	return guard(func() *C.pelican_error {
+		if err := requireInit(); err != nil {
+			return makeError(err)
+		}
+		te, err := getEngine()
+		if err != nil {
+			return makeError(fmt.Errorf("failed to start transfer engine: %w", err))
+		}
+		opts, recursive := buildOptions(copts, nil)
+		tc, err := te.NewClient(opts...)
+		if err != nil {
+			return makeError(err)
+		}
+		ctx := goCtxFor(cctx)
+		tj, err := makeJob(ctx, tc, kind, a, b, recursive, opts)
+		if err != nil {
+			tc.Cancel()
+			return makeError(err)
+		}
+		if err := tc.Submit(tj); err != nil {
+			tc.Cancel()
+			return makeError(err)
+		}
+		results, err := tc.Shutdown()
+		if listOut != nil {
+			*listOut = makeResultList(results, a)
+		}
+		if err == nil {
+			_, err = tj.GetLookupStatus()
+		}
+		if err == nil {
+			for i := range results {
+				if results[i].Error != nil {
+					err = results[i].Error
+					break
+				}
+			}
+		}
+		return makeError(err)
+	})
+}
+
+func startTransfer(kind xferKind, a, b string, copts *C.pelican_transfer_opts, out **C.pelican_transfer) *C.pelican_error {
 	return guard(func() *C.pelican_error {
 		if err := requireInit(); err != nil {
 			return makeError(err)
@@ -560,7 +673,7 @@ func startTransfer(remote, local string, upload bool, copts *C.pelican_transfer_
 		cxfer.handle = C.uintptr_t(cgo.NewHandle(ts))
 		cxfer.notify_fd = C.int(fds[0])
 		opts, recursive := buildOptions(copts, sink)
-		go runTransfer(ctx, ts, te, remote, local, upload, recursive, opts)
+		go runTransfer(ctx, ts, te, kind, a, b, recursive, opts)
 		*out = cxfer
 		return nil
 	})
@@ -568,12 +681,74 @@ func startTransfer(remote, local string, upload bool, copts *C.pelican_transfer_
 
 //export pelicanc_get_start
 func pelicanc_get_start(remoteUrl, localPath *C.char, copts *C.pelican_transfer_opts, out **C.pelican_transfer) *C.pelican_error {
-	return startTransfer(C.GoString(remoteUrl), C.GoString(localPath), false, copts, out)
+	return startTransfer(kindGet, C.GoString(remoteUrl), C.GoString(localPath), copts, out)
 }
 
 //export pelicanc_put_start
 func pelicanc_put_start(localPath, remoteUrl *C.char, copts *C.pelican_transfer_opts, out **C.pelican_transfer) *C.pelican_error {
-	return startTransfer(C.GoString(remoteUrl), C.GoString(localPath), true, copts, out)
+	return startTransfer(kindPut, C.GoString(remoteUrl), C.GoString(localPath), copts, out)
+}
+
+//export pelicanc_copy_start
+func pelicanc_copy_start(sourceUrl, destUrl *C.char, copts *C.pelican_transfer_opts, out **C.pelican_transfer) *C.pelican_error {
+	return startTransfer(kindCopy, C.GoString(sourceUrl), C.GoString(destUrl), copts, out)
+}
+
+//export pelicanc_prestage_start
+func pelicanc_prestage_start(remoteUrl *C.char, copts *C.pelican_transfer_opts, out **C.pelican_transfer) *C.pelican_error {
+	return startTransfer(kindPrestage, C.GoString(remoteUrl), "", copts, out)
+}
+
+//export pelicanc_copy
+func pelicanc_copy(cctx *C.pelican_context, sourceUrl, destUrl *C.char, copts *C.pelican_transfer_opts, listOut **C.pelican_result_list) *C.pelican_error {
+	return runSyncEngineJob(cctx, kindCopy, C.GoString(sourceUrl), C.GoString(destUrl), copts, listOut)
+}
+
+//export pelicanc_prestage
+func pelicanc_prestage(cctx *C.pelican_context, remoteUrl *C.char, copts *C.pelican_transfer_opts, listOut **C.pelican_result_list) *C.pelican_error {
+	return runSyncEngineJob(cctx, kindPrestage, C.GoString(remoteUrl), "", copts, listOut)
+}
+
+//export pelicanc_cache_info
+func pelicanc_cache_info(cctx *C.pelican_context, remoteUrl *C.char, copts *C.pelican_transfer_opts, ageOut, sizeOut *C.longlong) *C.pelican_error {
+	return guard(func() *C.pelican_error {
+		if err := requireInit(); err != nil {
+			return makeError(err)
+		}
+		opts, _ := buildOptions(copts, nil)
+		age, size, err := client.DoCacheInfo(goCtxFor(cctx), C.GoString(remoteUrl), opts...)
+		if err != nil {
+			return makeError(err)
+		}
+		if ageOut != nil {
+			*ageOut = C.longlong(age)
+		}
+		if sizeOut != nil {
+			*sizeOut = C.longlong(size)
+		}
+		return nil
+	})
+}
+
+//export pelicanc_evict
+func pelicanc_evict(cctx *C.pelican_context, remoteUrl *C.char, immediate C.int, copts *C.pelican_transfer_opts, messageOut **C.char) *C.pelican_error {
+	return guard(func() *C.pelican_error {
+		if err := requireInit(); err != nil {
+			return makeError(err)
+		}
+		if messageOut != nil {
+			*messageOut = nil
+		}
+		opts, _ := buildOptions(copts, nil)
+		message, err := client.DoEvict(goCtxFor(cctx), C.GoString(remoteUrl), immediate != 0, opts...)
+		if err != nil {
+			return makeError(err)
+		}
+		if messageOut != nil && message != "" {
+			*messageOut = C.CString(message)
+		}
+		return nil
+	})
 }
 
 //export pelicanc_transfer_next_result

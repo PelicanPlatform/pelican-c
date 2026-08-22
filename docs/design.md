@@ -140,10 +140,25 @@ point the shim can share the global engine across opens.
   worth documenting.
 - Go runtime + `fork()` without `exec()` is unsupported; see README.
 
+## Operation coverage
+
+Transfers (get/put), third-party copy (WebDAV COPY via `NewCopyJob`),
+and prestage all exist in both synchronous and asynchronous (fd-notified)
+forms; copy and prestage share the same engine-backed machinery as
+get/put, differing only in job construction.  Namespace ops (stat, list,
+delete), cache management (`pelican_cache_info`, `pelican_evict`), and
+PelicanFS file I/O are synchronous.  Results carry the server ETag and
+checksums (server-reported, falling back to client-computed), hex-encoded
+with HTTP digest names.
+
+Deliberately not exposed: interactive token acquisition (the library is
+always non-interactive), sharing-URL creation, shadow ingest, and the
+`object sync` synchronization semantics.
+
 ## Roadmap ideas
 
 - Async variants of stat/list and non-blocking file I/O (read request +
   notification-fd completion), if DaemonCore ends up needing them.
-- Expose prestage (`client.DoPrestage`) and cache eviction.
-- Surface checksums and ETags in `pelican_result`.
-- pkg-config file + install target; Linux/macOS CI.
+- Preferred-cache selection (`WithCaches`) and checksum-request knobs
+  (`WithRequestChecksums` / `WithRequireChecksum`) in the options object.
+- pkg-config file + install target.

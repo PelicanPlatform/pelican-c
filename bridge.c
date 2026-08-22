@@ -43,6 +43,12 @@ pelicanc_result_alloc(void)
     return calloc(1, sizeof(pelican_result));
 }
 
+struct pelican_checksum *
+pelicanc_checksum_alloc(size_t n)
+{
+    return calloc(n, sizeof(struct pelican_checksum));
+}
+
 pelican_result_list *
 pelicanc_result_list_alloc(size_t n)
 {
@@ -133,6 +139,10 @@ pelican_transfer_opts_free(pelican_transfer_opts *opts)
         return;
     free(opts->token);
     free(opts->token_location);
+    free(opts->source_token);
+    free(opts->source_token_location);
+    free(opts->dest_token);
+    free(opts->dest_token_location);
     free(opts);
 }
 
@@ -155,6 +165,34 @@ pelican_transfer_opts_set_token_location(pelican_transfer_opts *opts,
                                          const char *path)
 {
     set_string_field(&opts->token_location, path);
+}
+
+void
+pelican_transfer_opts_set_source_token(pelican_transfer_opts *opts,
+                                       const char *token)
+{
+    set_string_field(&opts->source_token, token);
+}
+
+void
+pelican_transfer_opts_set_source_token_location(pelican_transfer_opts *opts,
+                                                const char *path)
+{
+    set_string_field(&opts->source_token_location, path);
+}
+
+void
+pelican_transfer_opts_set_destination_token(pelican_transfer_opts *opts,
+                                            const char *token)
+{
+    set_string_field(&opts->dest_token, token);
+}
+
+void
+pelican_transfer_opts_set_destination_token_location(
+    pelican_transfer_opts *opts, const char *path)
+{
+    set_string_field(&opts->dest_token_location, path);
 }
 
 void
@@ -212,13 +250,44 @@ pelican_result_error(const pelican_result *res)
     return res->error;
 }
 
+const char *
+pelican_result_etag(const pelican_result *res)
+{
+    return res->etag;
+}
+
+size_t
+pelican_result_checksum_count(const pelican_result *res)
+{
+    return res->n_checksums;
+}
+
+const char *
+pelican_result_checksum_type(const pelican_result *res, size_t i)
+{
+    return i < res->n_checksums ? res->checksums[i].type : NULL;
+}
+
+const char *
+pelican_result_checksum_value(const pelican_result *res, size_t i)
+{
+    return i < res->n_checksums ? res->checksums[i].value : NULL;
+}
+
 void
 pelican_result_free(pelican_result *res)
 {
+    size_t i;
     if (!res)
         return;
     free(res->source);
     free(res->endpoint);
+    free(res->etag);
+    for (i = 0; i < res->n_checksums; i++) {
+        free(res->checksums[i].type);
+        free(res->checksums[i].value);
+    }
+    free(res->checksums);
     pelican_error_free(res->error);
     free(res);
 }
@@ -404,6 +473,64 @@ pelican_put(pelican_context *ctx, const char *local_path,
 {
     return pelicanc_put(ctx, (char *)local_path, (char *)remote_url,
                         (pelican_transfer_opts *)opts, results);
+}
+
+pelican_error *
+pelican_copy(pelican_context *ctx, const char *source_url,
+             const char *dest_url, const pelican_transfer_opts *opts,
+             pelican_result_list **results)
+{
+    return pelicanc_copy(ctx, (char *)source_url, (char *)dest_url,
+                         (pelican_transfer_opts *)opts, results);
+}
+
+pelican_error *
+pelican_prestage(pelican_context *ctx, const char *remote_url,
+                 const pelican_transfer_opts *opts,
+                 pelican_result_list **results)
+{
+    return pelicanc_prestage(ctx, (char *)remote_url,
+                             (pelican_transfer_opts *)opts, results);
+}
+
+pelican_error *
+pelican_copy_start(const char *source_url, const char *dest_url,
+                   const pelican_transfer_opts *opts, pelican_transfer **xfer)
+{
+    return pelicanc_copy_start((char *)source_url, (char *)dest_url,
+                               (pelican_transfer_opts *)opts, xfer);
+}
+
+pelican_error *
+pelican_prestage_start(const char *remote_url,
+                       const pelican_transfer_opts *opts,
+                       pelican_transfer **xfer)
+{
+    return pelicanc_prestage_start((char *)remote_url,
+                                   (pelican_transfer_opts *)opts, xfer);
+}
+
+pelican_error *
+pelican_cache_info(pelican_context *ctx, const char *remote_url,
+                   const pelican_transfer_opts *opts, long long *age_s,
+                   long long *size)
+{
+    return pelicanc_cache_info(ctx, (char *)remote_url,
+                               (pelican_transfer_opts *)opts, age_s, size);
+}
+
+pelican_error *
+pelican_evict(pelican_context *ctx, const char *remote_url, int immediate,
+              const pelican_transfer_opts *opts, char **message)
+{
+    return pelicanc_evict(ctx, (char *)remote_url, immediate,
+                          (pelican_transfer_opts *)opts, message);
+}
+
+void
+pelican_string_free(char *s)
+{
+    free(s);
 }
 
 pelican_error *

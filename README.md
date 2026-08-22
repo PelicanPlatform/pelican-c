@@ -27,7 +27,19 @@ make integration-test  # in-process federation test (no XRootD needed)
 CI runs the build/smoke matrix and the federation integration test —
 which launches a complete in-process Pelican federation using the
 pure-Go serving paths (posixv2 origin, V2 cache) and drives this
-library's C API against it — on Linux and macOS.
+library's C API against it, with TLS fully verified against the
+federation's generated CA — on Linux and macOS.
+
+## Releases
+
+Pushing a `v*` tag builds and attaches release archives (shared library
+plus `include/pelican/client.h`) for linux/{amd64,arm64} and
+darwin/{amd64,arm64}, with SHA-256 checksums.  The Linux archives are
+built inside an AlmaLinux 8 container, so they link against **glibc
+2.28** — running on EL8 and newer, Debian 10+, and Ubuntu 20.04+ (musl
+distributions like Alpine are not covered).  A `workflow_dispatch` run
+of the release workflow builds the same archives as workflow artifacts
+without publishing anything.
 
 ## Quick start (synchronous)
 
@@ -97,10 +109,12 @@ notification-fd protocol, and API conventions.
 | Area | Functions |
 | --- | --- |
 | Setup | `pelican_client_init`, `pelican_config_set`, `pelican_version` |
-| Options | `pelican_transfer_opts_new/_free`, `..._set_token`, `..._set_token_location`, `..._set_recursive`, `..._set_progress` |
-| Sync transfers | `pelican_get`, `pelican_put` (+ `pelican_result_list_*` accessors) |
-| Async transfers | `pelican_get_start`, `pelican_put_start`, `pelican_transfer_notify_fd`, `..._next_result`, `..._is_done`, `..._error`, `..._cancel`, `..._free` |
+| Options | `pelican_transfer_opts_new/_free`, `..._set_token(_location)`, `..._set_source_token(_location)`, `..._set_destination_token(_location)`, `..._set_recursive`, `..._set_progress` |
+| Sync transfers | `pelican_get`, `pelican_put`, `pelican_copy` (third-party copy), `pelican_prestage` (+ `pelican_result_list_*` accessors) |
+| Async transfers | `pelican_get_start`, `pelican_put_start`, `pelican_copy_start`, `pelican_prestage_start`, `pelican_transfer_notify_fd`, `..._next_result`, `..._is_done`, `..._error`, `..._cancel`, `..._free` |
+| Results | `pelican_result_source/_transferred_bytes/_endpoint/_transfer_time_s/_attempts/_error/_etag/_checksum_*` |
 | Namespace | `pelican_stat`, `pelican_list`, `pelican_delete` (+ `pelican_file_info_*` accessors) |
+| Cache management | `pelican_cache_info`, `pelican_evict` |
 | File I/O | `pelican_fs_open`, `pelican_file_read/_pread/_write/_seek/_stat/_close` |
 | Errors | `pelican_error_message`, `..._is_retryable`, `..._code`, `..._free` |
 

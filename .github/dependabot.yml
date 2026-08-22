@@ -1,0 +1,13 @@
+version: 2
+updates:
+  # Keep the SHA-pinned actions current (dependabot updates the pin and
+  # the version comment together).
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly

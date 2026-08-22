@@ -18,9 +18,9 @@ jobs:
         os: [ubuntu-24.04, macos-15]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
           cache: true
@@ -38,7 +38,8 @@ jobs:
 
   # Launches a full in-process Pelican federation using the pure-Go
   # serving paths (posixv2 origin, V2 cache), so no XRootD installation
-  # is needed, and drives the compiled C library against it.
+  # is needed, and drives the compiled C library against it.  TLS is
+  # fully verified against the federation's generated CA.
   integration:
     name: Federation integration (${{ matrix.os }})
     strategy:
@@ -47,9 +48,9 @@ jobs:
         os: [ubuntu-24.04, macos-15]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
           cache: true

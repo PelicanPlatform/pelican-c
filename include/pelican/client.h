@@ -148,6 +148,18 @@ void pelican_transfer_opts_set_progress(pelican_transfer_opts *opts,
                                         pelican_progress_fn fn,
                                         void *user_data);
 
+/* For third-party copies, the source and destination may need different
+ * credentials; these override the plain token/token_location for the
+ * respective side.  (All values copied; NULL clears.) */
+void pelican_transfer_opts_set_source_token(pelican_transfer_opts *opts,
+                                            const char *token);
+void pelican_transfer_opts_set_source_token_location(
+    pelican_transfer_opts *opts, const char *path);
+void pelican_transfer_opts_set_destination_token(pelican_transfer_opts *opts,
+                                                 const char *token);
+void pelican_transfer_opts_set_destination_token_location(
+    pelican_transfer_opts *opts, const char *path);
+
 /* ------------------------------------------------------------------ *
  * Per-object transfer results                                        *
  * ------------------------------------------------------------------ */
@@ -167,6 +179,15 @@ int pelican_result_attempts(const pelican_result *res);
 /** Per-object failure, or NULL on success.  Borrowed: owned by the
  *  result; do NOT pass to pelican_error_free(). */
 const pelican_error *pelican_result_error(const pelican_result *res);
+/** ETag reported by the server, or NULL. */
+const char *pelican_result_etag(const pelican_result *res);
+/** Checksums for the object: server-reported when available, otherwise
+ *  client-computed.  Types are HTTP digest names (e.g. "md5",
+ *  "adler32"); values are hex-encoded.  Getters return NULL if i is out
+ *  of range. */
+size_t pelican_result_checksum_count(const pelican_result *res);
+const char *pelican_result_checksum_type(const pelican_result *res, size_t i);
+const char *pelican_result_checksum_value(const pelican_result *res, size_t i);
 /** Release a result popped from pelican_transfer_next_result(). */
 void pelican_result_free(pelican_result *res);
 
@@ -201,6 +222,28 @@ pelican_error *pelican_put(pelican_context *ctx,
                            const char *remote_url,
                            const pelican_transfer_opts *opts,
                            pelican_result_list **results);
+
+/**
+ * Third-party copy: instruct the destination to copy the object directly
+ * from the source (WebDAV COPY), without the data flowing through this
+ * client.  Both URLs are remote.  Use the source/destination token
+ * setters when the two sides need different credentials.
+ */
+pelican_error *pelican_copy(pelican_context *ctx,
+                            const char *source_url,
+                            const char *dest_url,
+                            const pelican_transfer_opts *opts,
+                            pelican_result_list **results);
+
+/**
+ * Ask the federation caches to stage `remote_url` (recursively, if opts
+ * says so) without downloading it locally.  Results report per-object
+ * staging outcomes.
+ */
+pelican_error *pelican_prestage(pelican_context *ctx,
+                                const char *remote_url,
+                                const pelican_transfer_opts *opts,
+                                pelican_result_list **results);
 
 /* ------------------------------------------------------------------ *
  * Asynchronous transfers                                             *
@@ -245,6 +288,17 @@ pelican_error *pelican_put_start(const char *local_path,
                                  const char *remote_url,
                                  const pelican_transfer_opts *opts,
                                  pelican_transfer **xfer);
+
+/** Begin an asynchronous third-party copy (see pelican_copy). */
+pelican_error *pelican_copy_start(const char *source_url,
+                                  const char *dest_url,
+                                  const pelican_transfer_opts *opts,
+                                  pelican_transfer **xfer);
+
+/** Begin an asynchronous prestage (see pelican_prestage). */
+pelican_error *pelican_prestage_start(const char *remote_url,
+                                      const pelican_transfer_opts *opts,
+                                      pelican_transfer **xfer);
 
 /**
  * Notification fd: becomes readable when results are pending or the
@@ -328,6 +382,29 @@ pelican_error *pelican_list(pelican_context *ctx,
 pelican_error *pelican_delete(pelican_context *ctx,
                               const char *remote_url,
                               const pelican_transfer_opts *opts);
+
+/** Query whether (and how) a cache holds the object: *age_s is the
+ *  cached copy's age in seconds (-1 if unknown/not cached) and *size
+ *  its size in bytes.  Either out-pointer may be NULL. */
+pelican_error *pelican_cache_info(pelican_context *ctx,
+                                  const char *remote_url,
+                                  const pelican_transfer_opts *opts,
+                                  long long *age_s,
+                                  long long *size);
+
+/**
+ * Evict the object from federation caches.  If immediate is nonzero,
+ * request synchronous eviction.  On success *message (if non-NULL)
+ * receives a human-readable status; free it with pelican_string_free().
+ */
+pelican_error *pelican_evict(pelican_context *ctx,
+                             const char *remote_url,
+                             int immediate,
+                             const pelican_transfer_opts *opts,
+                             char **message);
+
+/** Free a string returned via an out-parameter (e.g. pelican_evict). */
+void pelican_string_free(char *s);
 
 /* ------------------------------------------------------------------ *
  * File I/O (PelicanFS)                                               *

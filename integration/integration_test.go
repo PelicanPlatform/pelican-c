@@ -131,12 +131,18 @@ func TestCClientFederation(t *testing.T) {
 	require.NoError(t, os.WriteFile(tokenFile, []byte(tok), 0600))
 
 	// The driver must see only the test federation: strip any ambient
-	// Pelican configuration and point HOME somewhere empty.
+	// Pelican configuration and point HOME somewhere empty.  TLS is
+	// fully verified — the client trusts the federation's generated CA
+	// (Server.TLSCACertificateFile is added to the system pool); skipping
+	// verification in tests is forbidden, as it has hidden real bugs.
+	caFile := param.Server_TLSCACertificateFile.GetString()
+	require.NotEmpty(t, caFile)
+	require.FileExists(t, caFile)
 	env := []string{
 		"HOME=" + t.TempDir(),
 		"PATH=" + os.Getenv("PATH"),
 		"PELICAN_FEDERATION_DISCOVERYURL=" + fedUrlStr,
-		"PELICAN_TLSSKIPVERIFY=true",
+		"PELICAN_SERVER_TLSCACERTIFICATEFILE=" + caFile,
 		"BEARER_TOKEN_FILE=" + tokenFile,
 	}
 	if v, ok := os.LookupEnv("DYLD_FALLBACK_LIBRARY_PATH"); ok {
@@ -202,5 +208,32 @@ func TestCClientFederation(t *testing.T) {
 		stdout, _, code = runDriver(t, driver, env, "fs-read", remote)
 		require.Equal(t, 0, code)
 		assert.Equal(t, uploadContent, stdout)
+	})
+
+	t.Run("third-party-copy", func(t *testing.T) {
+		src := objectUrl("hello_world.txt")
+		dest := objectUrl("pelican-c-copied.txt")
+
+		stdout, _, code := runDriver(t, driver, env, "copy", src, dest)
+		require.Equal(t, 0, code)
+		assert.Contains(t, stdout, "object=")
+
+		stdout, _, code = runDriver(t, driver, env, "fs-read", dest)
+		require.Equal(t, 0, code)
+		assert.Equal(t, helloContent, stdout)
+	})
+
+	t.Run("delete", func(t *testing.T) {
+		remote := objectUrl("pelican-c-upload.txt")
+
+		_, _, code := runDriver(t, driver, env, "delete", remote)
+		require.Equal(t, 0, code)
+
+		// The object must now be gone from the origin.  Stat with
+		// ?directread: the earlier read-back cached the object, and a
+		// plain stat is happily answered by the cache's lingering copy.
+		_, stderr, code := runDriver(t, driver, env, "stat", remote+"?directread")
+		require.NotEqual(t, 0, code, "stat of deleted object should fail")
+		assert.Contains(t, stderr, "stat failed")
 	})
 }

@@ -39,18 +39,30 @@ struct pelican_file {
 struct pelican_transfer_opts {
     char *token;
     char *token_location;
+    char *source_token;
+    char *source_token_location;
+    char *dest_token;
+    char *dest_token_location;
     int   recursive;
     pelican_progress_fn progress;
     void *progress_data;
 };
 
+struct pelican_checksum {
+    char *type;  /* HTTP digest name */
+    char *value; /* hex-encoded */
+};
+
 struct pelican_result {
     char          *source;
     char          *endpoint;
+    char          *etag;
     long long      transferred_bytes;
     double         transfer_time_s;
     int            attempts;
     pelican_error *error;
+    struct pelican_checksum *checksums;
+    size_t         n_checksums;
 };
 
 struct pelican_result_list {
@@ -78,6 +90,7 @@ void pelicanc_invoke_progress(pelican_progress_fn fn, const char *object,
 /* calloc-based allocators so Go hands out C-owned memory. */
 pelican_error *pelicanc_error_alloc(void);
 pelican_result *pelicanc_result_alloc(void);
+struct pelican_checksum *pelicanc_checksum_alloc(size_t n);
 pelican_result_list *pelicanc_result_list_alloc(size_t n);
 pelican_file_info *pelicanc_file_info_alloc(void);
 pelican_file_info_list *pelicanc_file_info_list_alloc(size_t n);

@@ -9,6 +9,7 @@
  *   integration_client get       <url> <local-path>
  *   integration_client get-async <url> <local-path>
  *   integration_client put       <local-path> <url>
+ *   integration_client copy      <source-url> <dest-url>
  *   integration_client fs-read   <url>
  *   integration_client delete    <url>
  *
@@ -85,6 +86,12 @@ report_results(pelican_result_list *results)
         } else {
             printf("object=%s bytes=%lld\n", pelican_result_source(r),
                    pelican_result_transferred_bytes(r));
+            if (pelican_result_etag(r) != NULL)
+                printf("etag=%s\n", pelican_result_etag(r));
+            for (size_t c = 0; c < pelican_result_checksum_count(r); c++)
+                printf("checksum=%s:%s\n",
+                       pelican_result_checksum_type(r, c),
+                       pelican_result_checksum_value(r, c));
         }
     }
     pelican_result_list_free(results);
@@ -108,6 +115,16 @@ cmd_put(const char *local_path, const char *url)
     pelican_error *err = pelican_put(NULL, local_path, url, NULL, &results);
     if (err != NULL)
         return fail("put", err);
+    return report_results(results) ? 1 : 0;
+}
+
+static int
+cmd_copy(const char *source_url, const char *dest_url)
+{
+    pelican_result_list *results = NULL;
+    pelican_error *err = pelican_copy(NULL, source_url, dest_url, NULL, &results);
+    if (err != NULL)
+        return fail("copy", err);
     return report_results(results) ? 1 : 0;
 }
 
@@ -252,6 +269,8 @@ main(int argc, char **argv)
         return cmd_get_async(argv[2], argv[3]);
     if (strcmp(cmd, "put") == 0 && argc >= 4)
         return cmd_put(argv[2], argv[3]);
+    if (strcmp(cmd, "copy") == 0 && argc >= 4)
+        return cmd_copy(argv[2], argv[3]);
     if (strcmp(cmd, "fs-read") == 0)
         return cmd_fs_read(argv[2]);
     if (strcmp(cmd, "delete") == 0)
