@@ -52,7 +52,11 @@ jobs:
           int main(void) { printf("%s\n", pelican_version()); return 0; }
           EOF
           cc -o /tmp/pcprobe /tmp/pcprobe.c $(pkg-config --cflags --libs libpelicanclient)
-          /tmp/pcprobe
+          # An ELF consumer records only the soname, so a prefix outside
+          # the loader's default search path needs LD_LIBRARY_PATH (or
+          # ldconfig, or an -rpath).  macOS resolves the absolute install
+          # name and ignores this.
+          LD_LIBRARY_PATH="$prefix/lib" /tmp/pcprobe
           make uninstall PREFIX="$prefix"
 
   # Launches a full in-process Pelican federation using the pure-Go

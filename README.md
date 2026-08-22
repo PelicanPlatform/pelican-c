@@ -33,6 +33,13 @@ so consumers build with:
 cc myapp.c $(pkg-config --cflags --libs libpelicanclient)
 ```
 
+The library carries an soname, so on Linux a prefix outside the
+loader's default search path needs the usual configuration at run time —
+`ldconfig`, `LD_LIBRARY_PATH`, or linking the consumer with
+`-Wl,-rpath,<libdir>`.  (The pkg-config file deliberately does not force
+an rpath, which would interfere with distribution packaging.)  macOS
+records an absolute install name, so nothing extra is required there.
+
 CI runs the build/smoke matrix and the federation integration test —
 which launches a complete in-process Pelican federation using the
 pure-Go serving paths (posixv2 origin, V2 cache) and drives this
