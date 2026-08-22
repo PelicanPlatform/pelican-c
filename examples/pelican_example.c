@@ -1,5 +1,5 @@
 /*
- * pelican_example.c - demonstrate libpelicanclient usage.
+ * pelican_example.c - demonstrate synchronous libpelicanclient usage.
  *
  * Usage:
  *   pelican_example                       run the offline smoke test
@@ -12,7 +12,6 @@
 
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 
 #include <pelican/client.h>
 
@@ -28,8 +27,10 @@ progress(const char *object, long long transferred, long long total,
 static int
 fail(const char *what, pelican_error *err)
 {
-    fprintf(stderr, "%s failed: %s (retryable: %s)\n", what, err->message,
-            err->retryable ? "yes" : "no");
+    fprintf(stderr, "%s failed: %s (retryable: %s, code: %d)\n", what,
+            pelican_error_message(err),
+            pelican_error_is_retryable(err) ? "yes" : "no",
+            pelican_error_code(err));
     pelican_error_free(err);
     return 1;
 }
@@ -47,14 +48,15 @@ main(int argc, char **argv)
 
     if (argc < 2) {
         /* Offline smoke test: a malformed URL must produce an error,
-         * not a crash — and must not be flagged retryable. */
+         * not a crash. */
         pelican_file_info *info = NULL;
         err = pelican_stat(NULL, "not-a-valid-url", NULL, &info);
         if (err == NULL) {
             fprintf(stderr, "expected an error from a bogus stat\n");
             return 1;
         }
-        printf("bogus stat correctly failed: %s\n", err->message);
+        printf("bogus stat correctly failed: %s\n",
+               pelican_error_message(err));
         pelican_error_free(err);
         puts("smoke test passed");
         return 0;
@@ -65,42 +67,50 @@ main(int argc, char **argv)
     pelican_file_info *info = NULL;
     if ((err = pelican_stat(NULL, url, NULL, &info)) != NULL)
         return fail("pelican_stat", err);
-    printf("stat: name=%s size=%lld mtime=%lld collection=%d\n", info->name,
-           info->size, info->mtime, info->is_collection);
-    int is_collection = info->is_collection;
+    printf("stat: name=%s size=%lld mtime=%lld collection=%d\n",
+           pelican_file_info_name(info), pelican_file_info_size(info),
+           pelican_file_info_mtime(info),
+           pelican_file_info_is_collection(info));
+    int is_collection = pelican_file_info_is_collection(info);
     pelican_file_info_free(info);
 
     if (is_collection && argc < 3) {
-        pelican_file_info *entries = NULL;
-        size_t n = 0;
-        if ((err = pelican_list(NULL, url, NULL, &entries, &n)) != NULL)
+        pelican_file_info_list *entries = NULL;
+        if ((err = pelican_list(NULL, url, NULL, &entries)) != NULL)
             return fail("pelican_list", err);
-        for (size_t i = 0; i < n; i++)
-            printf("  %c %12lld %s\n", entries[i].is_collection ? 'd' : '-',
-                   entries[i].size, entries[i].name);
-        pelican_file_info_list_free(entries, n);
+        for (size_t i = 0; i < pelican_file_info_list_count(entries); i++) {
+            const pelican_file_info *e = pelican_file_info_list_get(entries, i);
+            printf("  %c %12lld %s\n",
+                   pelican_file_info_is_collection(e) ? 'd' : '-',
+                   pelican_file_info_size(e), pelican_file_info_name(e));
+        }
+        pelican_file_info_list_free(entries);
     }
 
     if (argc >= 3) {
-        pelican_transfer_opts opts;
-        memset(&opts, 0, sizeof(opts));
-        opts.progress = progress;
+        pelican_transfer_opts *opts = pelican_transfer_opts_new();
+        pelican_transfer_opts_set_progress(opts, progress, NULL);
 
         pelican_context *ctx = pelican_context_new();
-        pelican_result *results = NULL;
-        size_t n_results = 0;
-        err = pelican_get(ctx, url, argv[2], &opts, &results, &n_results);
+        pelican_result_list *results = NULL;
+        err = pelican_get(ctx, url, argv[2], opts, &results);
         pelican_context_free(ctx);
+        pelican_transfer_opts_free(opts);
         if (err != NULL)
             return fail("pelican_get", err);
-        for (size_t i = 0; i < n_results; i++)
+        for (size_t i = 0; i < pelican_result_list_count(results); i++) {
+            const pelican_result *r = pelican_result_list_get(results, i);
             printf("downloaded %s: %lld bytes from %s in %.3fs "
                    "(%d attempt%s)\n",
-                   results[i].source, results[i].transferred_bytes,
-                   results[i].endpoint ? results[i].endpoint : "?",
-                   results[i].transfer_time_s, results[i].attempts,
-                   results[i].attempts == 1 ? "" : "s");
-        pelican_results_free(results, n_results);
+                   pelican_result_source(r),
+                   pelican_result_transferred_bytes(r),
+                   pelican_result_endpoint(r) ? pelican_result_endpoint(r)
+                                              : "?",
+                   pelican_result_transfer_time_s(r),
+                   pelican_result_attempts(r),
+                   pelican_result_attempts(r) == 1 ? "" : "s");
+        }
+        pelican_result_list_free(results);
     }
 
     return 0;

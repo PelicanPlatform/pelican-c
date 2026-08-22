@@ -6,14 +6,15 @@
  * transfers into C/C++ applications such as HTCondor.
  *
  * Conventions:
+ *  - Every type is opaque; all access goes through getter/setter
+ *    functions so struct layout is never part of the ABI.
  *  - Every function that can fail returns a `pelican_error *`; NULL means
- *    success.  Errors must be released with pelican_error_free().
- *  - All output objects (results, file infos) are allocated by the library
- *    and released with the matching *_free() function.  The caller never
- *    allocates library structs except pelican_transfer_opts, which is
- *    caller-owned and must be zero-initialized (memset or `= {0}`) so that
- *    unset fields pick up defaults.
- *  - All functions are thread-safe once pelican_client_init() has returned.
+ *    success.  Errors must be released with pelican_error_free() unless
+ *    documented as borrowed.
+ *  - Strings returned by getters are borrowed: valid until the owning
+ *    object is freed, and must not be freed by the caller.
+ *  - All functions are thread-safe once pelican_client_init() has
+ *    returned, but see the per-section notes on which calls block.
  *  - Strings are NUL-terminated UTF-8.
  *
  * Copyright (C) 2026, Pelican Project, Morgridge Institute for Research
@@ -33,11 +34,17 @@ extern "C" {
  * Errors                                                             *
  * ------------------------------------------------------------------ */
 
-typedef struct pelican_error {
-    char *message;   /* human-readable description; never NULL */
-    int   retryable; /* nonzero if retrying the operation may succeed */
-    int   code;      /* reserved for future error taxonomy; currently 0 */
-} pelican_error;
+typedef struct pelican_error pelican_error;
+
+/** Human-readable description; borrowed, never NULL. */
+const char *pelican_error_message(const pelican_error *err);
+
+/** Nonzero if retrying the operation may succeed (the same
+ *  classification the pelican CLI uses for its retry decisions). */
+int pelican_error_is_retryable(const pelican_error *err);
+
+/** Numeric code from the Pelican error taxonomy, or 0 if unclassified. */
+int pelican_error_code(const pelican_error *err);
 
 /** Release an error returned by any pelican_* call.  NULL is a no-op. */
 void pelican_error_free(pelican_error *err);
@@ -67,15 +74,17 @@ pelican_error *pelican_client_init(const char *config_file);
 const char *pelican_version(void);
 
 /* ------------------------------------------------------------------ *
- * Cancellation contexts                                              *
+ * Cancellation contexts (for the synchronous calls)                  *
  * ------------------------------------------------------------------ */
 
 /**
- * A cancellation handle.  Optional: pass NULL wherever a
- * pelican_context* is accepted to run without external cancellation.
- * pelican_context_cancel() may be called from any thread; in-flight
- * operations using the context return promptly with a non-retryable
- * "context canceled" error.
+ * A cancellation handle for the *synchronous* operations.  Optional:
+ * pass NULL wherever a pelican_context* is accepted to run without
+ * external cancellation.  pelican_context_cancel() may be called from
+ * any thread; in-flight operations using the context return promptly
+ * with a non-retryable "context canceled" error.  (Asynchronous
+ * transfers and open files carry their own cancellation — see
+ * pelican_transfer_cancel and pelican_file_close.)
  */
 typedef struct pelican_context pelican_context;
 
@@ -91,7 +100,9 @@ void pelican_context_free(pelican_context *ctx);
 /**
  * Progress callback.  Invoked periodically during a transfer from a
  * library-owned thread (NOT the calling thread); it must be thread-safe
- * and must not call back into the library.
+ * and must not call back into the library.  Event-loop applications
+ * should usually prefer the asynchronous API's notification fd over
+ * progress callbacks.
  *
  * object:      remote object path being transferred
  * transferred: bytes moved so far
@@ -105,71 +116,185 @@ typedef void (*pelican_progress_fn)(const char *object,
                                     void *user_data);
 
 /**
- * Options accepted by transfer and namespace operations.  Caller-owned;
- * zero-initialize, then set what you need.  The struct may grow in
- * future releases, so always memset to 0 rather than setting fields
- * positionally.
+ * Options accepted by transfer, namespace, and file operations.
+ * Caller-owned: create with pelican_transfer_opts_new(), release with
+ * pelican_transfer_opts_free() (safe once the call it was passed to has
+ * returned; string values are copied by the setters).
  */
-typedef struct pelican_transfer_opts {
-    const char *token;          /* bearer token contents, or NULL          */
-    const char *token_location; /* path to a token file, or NULL           */
-    int         recursive;      /* transfer/delete collections recursively */
-    pelican_progress_fn progress;      /* progress callback, or NULL       */
-    void               *progress_data; /* opaque pointer passed to callback */
-} pelican_transfer_opts;
+typedef struct pelican_transfer_opts pelican_transfer_opts;
+
+pelican_transfer_opts *pelican_transfer_opts_new(void);
+void pelican_transfer_opts_free(pelican_transfer_opts *opts);
+
+/** Bearer token contents to authenticate with (copied; NULL clears). */
+void pelican_transfer_opts_set_token(pelican_transfer_opts *opts,
+                                     const char *token);
+/** Path to a file holding the bearer token (copied; NULL clears). */
+void pelican_transfer_opts_set_token_location(pelican_transfer_opts *opts,
+                                              const char *path);
+/** Nonzero to transfer/delete collections recursively. */
+void pelican_transfer_opts_set_recursive(pelican_transfer_opts *opts,
+                                         int recursive);
+/** Progress callback and its opaque user pointer (NULL fn clears). */
+void pelican_transfer_opts_set_progress(pelican_transfer_opts *opts,
+                                        pelican_progress_fn fn,
+                                        void *user_data);
 
 /* ------------------------------------------------------------------ *
- * Transfers                                                          *
+ * Per-object transfer results                                        *
  * ------------------------------------------------------------------ */
 
-/** Result of one object transfer (a recursive job yields one per object). */
-typedef struct pelican_result {
-    char          *source;            /* remote object path                */
-    long long      transferred_bytes; /* bytes moved                       */
-    char          *endpoint;          /* host:port actually used, or NULL  */
-    double         transfer_time_s;   /* wall time of the last attempt     */
-    int            attempts;          /* number of attempts made           */
-    pelican_error *error;             /* per-object failure, NULL if OK    */
-} pelican_result;
+typedef struct pelican_result pelican_result;
 
-/** Free an array of `n` results returned by pelican_get/pelican_put. */
-void pelican_results_free(pelican_result *results, size_t n);
+/** Remote object path this result describes; borrowed. */
+const char *pelican_result_source(const pelican_result *res);
+/** Bytes moved for this object. */
+long long pelican_result_transferred_bytes(const pelican_result *res);
+/** host:port of the cache/origin used, or NULL if none was reached. */
+const char *pelican_result_endpoint(const pelican_result *res);
+/** Wall time of the final attempt, in seconds. */
+double pelican_result_transfer_time_s(const pelican_result *res);
+/** Number of attempts made. */
+int pelican_result_attempts(const pelican_result *res);
+/** Per-object failure, or NULL on success.  Borrowed: owned by the
+ *  result; do NOT pass to pelican_error_free(). */
+const pelican_error *pelican_result_error(const pelican_result *res);
+/** Release a result popped from pelican_transfer_next_result(). */
+void pelican_result_free(pelican_result *res);
+
+/** An immutable list of results, as returned by the synchronous calls. */
+typedef struct pelican_result_list pelican_result_list;
+
+size_t pelican_result_list_count(const pelican_result_list *list);
+/** Borrowed element; valid until the list is freed.  NULL if out of range. */
+const pelican_result *pelican_result_list_get(const pelican_result_list *list,
+                                              size_t i);
+void pelican_result_list_free(pelican_result_list *list);
+
+/* ------------------------------------------------------------------ *
+ * Synchronous transfers                                              *
+ * ------------------------------------------------------------------ */
 
 /**
  * Download `remote_url` (e.g. "pelican://osg-htc.org/ospool/.../file")
- * to `local_path`.  On success — and on per-object failure inside a
- * recursive transfer — `*results`/`*n_results` describe each object
- * transferred; free with pelican_results_free().  `results`/`n_results`
- * may be NULL if the caller does not want per-object detail.
+ * to `local_path`, blocking until the transfer completes.  On return,
+ * `*results` (if non-NULL) holds one entry per object transferred; free
+ * with pelican_result_list_free().
  */
 pelican_error *pelican_get(pelican_context *ctx,
                            const char *remote_url,
                            const char *local_path,
                            const pelican_transfer_opts *opts,
-                           pelican_result **results,
-                           size_t *n_results);
+                           pelican_result_list **results);
 
-/** Upload `local_path` to `remote_url`.  Same result semantics as get. */
+/** Upload `local_path` to `remote_url`.  Same semantics as pelican_get. */
 pelican_error *pelican_put(pelican_context *ctx,
                            const char *local_path,
                            const char *remote_url,
                            const pelican_transfer_opts *opts,
-                           pelican_result **results,
-                           size_t *n_results);
+                           pelican_result_list **results);
 
 /* ------------------------------------------------------------------ *
- * Namespace operations                                               *
+ * Asynchronous transfers                                             *
  * ------------------------------------------------------------------ */
 
-typedef struct pelican_file_info {
-    char     *name;          /* object name                       */
-    long long size;          /* size in bytes                     */
-    long long mtime;         /* modification time (Unix seconds)  */
-    int       is_collection; /* nonzero for directories           */
-} pelican_file_info;
+/**
+ * An in-flight transfer.  Designed for single-threaded event loops
+ * (e.g. HTCondor DaemonCore): no call in this section blocks, and
+ * completed per-object results are streamed as they finish rather than
+ * buffered into one final list.
+ *
+ * Usage:
+ *   1. pelican_get_start() / pelican_put_start() submits the transfer
+ *      and returns immediately.
+ *   2. Register pelican_transfer_notify_fd() for read events in your
+ *      event loop.  The fd becomes readable whenever results are
+ *      queued or the transfer finishes.  Do not read or close it.
+ *   3. On wakeup, call pelican_transfer_next_result() until it returns
+ *      0, freeing each popped result.
+ *   4. When pelican_transfer_is_done() reports completion, check
+ *      pelican_transfer_error() for a transfer-level failure, then
+ *      release everything with pelican_transfer_free().
+ *
+ * All calls on a given pelican_transfer must come from one thread (or
+ * be externally serialized); distinct transfers are independent.
+ */
+typedef struct pelican_transfer pelican_transfer;
 
+/** Begin an asynchronous download.  Fails only on malformed arguments
+ *  or an uninitialized library; transfer-time errors are reported
+ *  through the handle. */
+pelican_error *pelican_get_start(const char *remote_url,
+                                 const char *local_path,
+                                 const pelican_transfer_opts *opts,
+                                 pelican_transfer **xfer);
+
+/** Begin an asynchronous upload. */
+pelican_error *pelican_put_start(const char *local_path,
+                                 const char *remote_url,
+                                 const pelican_transfer_opts *opts,
+                                 pelican_transfer **xfer);
+
+/**
+ * Notification fd: becomes readable when results are pending or the
+ * transfer completes.  Owned by the library — register it with your
+ * event loop (level-triggered readiness), but never read from or close
+ * it.  Valid until pelican_transfer_free().
+ */
+int pelican_transfer_notify_fd(const pelican_transfer *xfer);
+
+/**
+ * Pop the next completed per-object result without blocking.
+ * Returns 1 and stores an owned result in *res (free with
+ * pelican_result_free), or 0 if none are pending — in which case the
+ * notification fd is quiesced until new events arrive.
+ */
+int pelican_transfer_next_result(pelican_transfer *xfer,
+                                 pelican_result **res);
+
+/** Nonzero once the transfer has finished producing results.  Queued
+ *  results may still be pending; drain with next_result. */
+int pelican_transfer_is_done(const pelican_transfer *xfer);
+
+/**
+ * Transfer-level failure (e.g. lookup or submission error), or NULL.
+ * Meaningful once is_done; borrowed — owned by the transfer, do NOT
+ * pass to pelican_error_free().  Per-object failures are reported on
+ * the individual results instead.
+ */
+const pelican_error *pelican_transfer_error(const pelican_transfer *xfer);
+
+/** Cancel an in-flight transfer.  Results already queued remain
+ *  poppable; the transfer finishes with a cancellation error. */
+void pelican_transfer_cancel(pelican_transfer *xfer);
+
+/** Cancel if needed and release the transfer, its queued results, and
+ *  the notification fd. */
+void pelican_transfer_free(pelican_transfer *xfer);
+
+/* ------------------------------------------------------------------ *
+ * Namespace operations (synchronous)                                 *
+ * ------------------------------------------------------------------ */
+
+typedef struct pelican_file_info pelican_file_info;
+
+/** Object name; borrowed. */
+const char *pelican_file_info_name(const pelican_file_info *info);
+/** Size in bytes. */
+long long pelican_file_info_size(const pelican_file_info *info);
+/** Modification time, Unix seconds. */
+long long pelican_file_info_mtime(const pelican_file_info *info);
+/** Nonzero for collections (directories). */
+int pelican_file_info_is_collection(const pelican_file_info *info);
 void pelican_file_info_free(pelican_file_info *info);
-void pelican_file_info_list_free(pelican_file_info *infos, size_t n);
+
+typedef struct pelican_file_info_list pelican_file_info_list;
+
+size_t pelican_file_info_list_count(const pelican_file_info_list *list);
+/** Borrowed element; valid until the list is freed.  NULL if out of range. */
+const pelican_file_info *
+pelican_file_info_list_get(const pelican_file_info_list *list, size_t i);
+void pelican_file_info_list_free(pelican_file_info_list *list);
 
 /** Stat a remote object.  On success *info must be freed with
  *  pelican_file_info_free(). */
@@ -178,18 +303,78 @@ pelican_error *pelican_stat(pelican_context *ctx,
                             const pelican_transfer_opts *opts,
                             pelican_file_info **info);
 
-/** List a remote collection.  On success *infos (length *n_infos) must be
- *  freed with pelican_file_info_list_free(). */
+/** List a remote collection.  On success *entries must be freed with
+ *  pelican_file_info_list_free(). */
 pelican_error *pelican_list(pelican_context *ctx,
                             const char *remote_url,
                             const pelican_transfer_opts *opts,
-                            pelican_file_info **infos,
-                            size_t *n_infos);
+                            pelican_file_info_list **entries);
 
-/** Delete a remote object (or collection, if opts->recursive). */
+/** Delete a remote object (or collection, if opts is recursive). */
 pelican_error *pelican_delete(pelican_context *ctx,
                               const char *remote_url,
                               const pelican_transfer_opts *opts);
+
+/* ------------------------------------------------------------------ *
+ * File I/O (PelicanFS)                                               *
+ * ------------------------------------------------------------------ */
+
+/**
+ * POSIX-like access to remote objects without staging them to local
+ * disk, backed by the Go client's PelicanFS.  These calls BLOCK on
+ * network I/O — from a single-threaded event loop, use them on worker
+ * threads/processes or where blocking is acceptable.
+ */
+typedef struct pelican_file pelican_file;
+
+/* Open flags (library-defined values; do not pass POSIX O_* here). */
+#define PELICAN_O_RDONLY 0
+#define PELICAN_O_WRONLY 1
+#define PELICAN_O_RDWR   2
+#define PELICAN_O_CREATE 4
+
+/** Open a remote object by URL.  On success *file must eventually be
+ *  released with pelican_file_close(). */
+pelican_error *pelican_fs_open(const char *remote_url,
+                               int flags,
+                               const pelican_transfer_opts *opts,
+                               pelican_file **file);
+
+/**
+ * Read up to `len` bytes at the current position.  Returns the number
+ * of bytes read, 0 at end-of-file, or -1 on error (with *err set if
+ * err is non-NULL).
+ */
+long long pelican_file_read(pelican_file *file, void *buf, size_t len,
+                            pelican_error **err);
+
+/** Positional read (does not move the file position).  Same return
+ *  conventions as pelican_file_read. */
+long long pelican_file_pread(pelican_file *file, void *buf, size_t len,
+                             long long offset, pelican_error **err);
+
+/** Append `len` bytes to an object opened for writing.  Returns bytes
+ *  written or -1 on error.  Uploads are streamed; the object is
+ *  finalized by pelican_file_close(). */
+long long pelican_file_write(pelican_file *file, const void *buf,
+                             size_t len, pelican_error **err);
+
+/** Reposition the read offset.  whence is SEEK_SET(0)/SEEK_CUR(1)/
+ *  SEEK_END(2).  Returns the new offset or -1 on error. */
+long long pelican_file_seek(pelican_file *file, long long offset,
+                            int whence, pelican_error **err);
+
+/** Stat the open file.  On success *info must be freed with
+ *  pelican_file_info_free(). */
+pelican_error *pelican_file_stat(pelican_file *file,
+                                 pelican_file_info **info);
+
+/**
+ * Close the file and release the handle (the handle is freed even if
+ * an error is returned).  For writes, this finalizes the upload and
+ * reports its outcome — always check the result.
+ */
+pelican_error *pelican_file_close(pelican_file *file);
 
 #ifdef __cplusplus
 } /* extern "C" */

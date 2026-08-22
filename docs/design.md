@@ -3,49 +3,99 @@
 ## Goal
 
 Give C/C++ hosts (HTCondor first) an in-process interface to the Pelican
-client: transfers, namespace operations, retryability classification, and
-cancellation — without shelling out to the `pelican` binary and
-re-parsing its output.
+client: transfers, namespace operations, retryability classification,
+cancellation, streamed results, and direct file I/O — without shelling
+out to the `pelican` binary and re-parsing its output.
 
 ## Architecture: three layers
 
 1. **`include/pelican/client.h`** — the public, const-correct, ABI-stable
-   header. The only header installed or included by consumers.
-2. **`bridge.c` / `bridge.h`** — plain C. Defines the public entry points
-   as thin forwarders, the `*_free` deallocators, the opaque
-   `struct pelican_context`, allocation helpers, and the progress-callback
-   trampoline.
+   header. Every type is opaque; all access is via functions, so no
+   struct layout is part of the ABI and fields can be added freely.
+2. **`bridge.c` / `bridge.h`** — plain C. bridge.h holds the real struct
+   layouts (internal only); bridge.c implements everything that needs no
+   Go — accessors, option setters, deallocators, allocation helpers, the
+   progress-callback trampoline — plus thin forwarders into the Go
+   exports for the rest.
 3. **`capi.go`** — the cgo implementation, exporting internal
    `pelicanc_*` symbols that the bridge forwards to.
 
-Two constraints force this split:
+Two cgo constraints force this split:
 
-- cgo cannot express `const char *` in `//export` signatures, and the
+- cgo cannot express `const` qualifiers in `//export` signatures, and the
   generated prototypes in `_cgo_export.h` would conflict with a
   const-qualified public header. Internal names + C forwarders keep the
   public API const-correct.
 - Files containing `//export` may not define functions in their cgo
-  preamble, so the helpers Go calls (trampoline, allocators) live in a
-  real C file.
+  preamble, so the helpers Go calls live in a real C file.
+
+## Asynchronous transfers and the notification fd
+
+The async API maps one `pelican_transfer` onto the Go client's streaming
+machinery: a shared, process-lifetime `TransferEngine` (started lazily on
+first use), a per-transfer `TransferClient`, and a goroutine that
+submits the job and ranges over `TransferClient.Results()` — so
+per-object results are consumed as the engine produces them, never
+buffered into one long list.
+
+Wakeups use a self-pipe with both ends non-blocking and close-on-exec.
+The invariants:
+
+- **Producer** (Go goroutine): under the state mutex, append the result
+  to the queue (or set the done flag / terminal error) and write one
+  byte to the pipe. `EAGAIN` on a full pipe is ignored — the fd is
+  already readable.
+- **Consumer** (`pelican_transfer_next_result`): under the same mutex,
+  pop one result if available; if the queue is empty, drain the pipe
+  completely and return 0. Because producers write their byte under the
+  lock, any event arriving after the drain re-arms the fd.
+
+This gives level-triggered semantics with no busy-wake: readable means
+"call `next_result` until it returns 0, then check `is_done`". The
+consumer never reads the pipe directly and no async call ever blocks,
+which is exactly the contract a DaemonCore `Register_Pipe` handler needs.
+
+Lifetime safety: the Go goroutine holds the state object directly (not
+via the cgo handle), so `pelican_transfer_free` during a live transfer
+is safe — free marks the state, releases queued C memory, and closes the
+pipe under the mutex; subsequent producer events free their payload
+immediately instead of enqueueing, and never touch the closed fds.
+
+## File I/O (PelicanFS)
+
+`pelican_fs_open` splits the URL into a federation prefix and object
+path, builds a `PelicanFS` via `NewPelicanFSWithPrefix`, and wraps the
+returned `fs.File`. Reads, positional reads (`io.ReaderAt` → HTTP range
+requests), seeks, and streamed writes map directly onto the PelicanFile
+implementation; `pelican_file_close` finalizes uploads and reports their
+outcome, so its error must always be checked.
+
+Each open file owns its own PelicanFS — and therefore its own
+`TransferEngine`, because upstream `PelicanFS` neither shares an engine
+nor exposes a shutdown. The wrapper cancels the FS's context on close to
+reap the engine's goroutines. Upstream fix worth pursuing: give
+`PelicanFS` a `Close()` (or accept a caller-provided engine), at which
+point the shim can share the global engine across opens.
 
 ## Conventions
 
 - **Errors**: every fallible function returns `pelican_error *`; NULL is
-  success. `retryable` comes from `client.ShouldRetry`, i.e. the same
-  classification the CLI uses. `code` is reserved for a future mapping of
-  the upstream `error_codes.PelicanError` taxonomy.
+  success. `retryable` comes from `client.ShouldRetry` — the same
+  classification the CLI uses. `code` carries the upstream
+  `error_codes.PelicanError` number when the error is classified
+  (e.g. 5011 Specification.FileNotFound), else 0.
 - **Memory**: all library-returned memory is malloc-family and released
-  by the typed `*_free` functions (Go hands out `C.CString` /
-  `calloc`-backed structs, so plain `free()` in bridge.c is correct).
-  The caller owns and zero-initializes `pelican_transfer_opts`.
+  by the typed `*_free` functions. Strings returned by getters are
+  borrowed, valid until the owning object is freed. `pelican_result_error`
+  and `pelican_transfer_error` return borrowed errors.
 - **Threading**: all entry points are thread-safe after
-  `pelican_client_init`. Progress callbacks arrive on library-owned
-  threads and must not call back into the library.
+  `pelican_client_init`, except that a single `pelican_transfer` or
+  `pelican_file` expects its calls serialized. Progress callbacks arrive
+  on library-owned threads and must not call back into the library.
+- **Blocking**: sync transfers, namespace ops, and file I/O block; the
+  entire async-transfer section never does.
 - **Panics**: every export runs under a recover() guard; a Go panic
   surfaces as a `pelican_error` instead of aborting the host process.
-- **Cancellation**: `pelican_context` wraps a Go `context.Context` via a
-  `cgo.Handle` stashed in an opaque struct; `pelican_context_cancel` is
-  safe from any thread.
 - **Non-interactive always**: `client.WithNonInteractive(true)` is
   unconditionally applied; an embedded library must never trigger an
   OAuth device-flow prompt.
@@ -66,6 +116,11 @@ Two constraints force this split:
   the error path goes through `newTransferResults`); the shim falls back
   to the request URL. Worth fixing upstream, at which point recursive
   downloads get accurate per-object sources.
+- `PelicanFS` lacks a shutdown/engine accessor (see above).
+- The async path submits jobs through the raw `TransferEngine`, so it
+  skips `DoGet`'s destination-layout conveniences (downloading into an
+  existing directory, collection guards). Callers should pass explicit
+  destination file paths.
 - One global configuration per process: `pelican_client_init` is
   once-only, and a failed init leaves the library unusable (viper global
   state cannot be safely re-initialized). Matches HTCondor's usage but
@@ -74,9 +129,8 @@ Two constraints force this split:
 
 ## Roadmap ideas
 
-- Streaming reads/writes (wrap `client.WithWriter` / `WithReader` or
-  `PelicanFS`) for transfer without touching local disk.
+- Async variants of stat/list and non-blocking file I/O (read request +
+  notification-fd completion), if DaemonCore ends up needing them.
 - Expose prestage (`client.DoPrestage`) and cache eviction.
 - Surface checksums and ETags in `pelican_result`.
-- Map `error_codes.PelicanError` numbers into `pelican_error.code`.
 - pkg-config file + install target; Linux/macOS CI.

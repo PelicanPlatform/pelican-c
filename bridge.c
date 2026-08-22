@@ -2,17 +2,19 @@
  * bridge.c - internal cgo helpers plus the public API entry points.
  *
  * The Go side exports internal `pelicanc_*` symbols (cgo cannot express
- * `const char *` in export signatures); the public, const-correct
- * functions declared in include/pelican/client.h are defined here as
- * thin forwarders.  Memory released by the *_free functions was
- * allocated with malloc/calloc (C.CString and the pelicanc_*_alloc
- * helpers), so plain free() is correct.
+ * `const` qualifiers in export signatures); the public, const-correct
+ * functions declared in include/pelican/client.h are defined here —
+ * either as pure C (accessors, allocation, deallocation) or as thin
+ * forwarders into the Go implementation.  Memory released here was
+ * allocated with malloc/calloc/strdup (C.CString and the pelicanc_*
+ * allocators), so plain free() is correct.
  *
  * Copyright (C) 2026, Pelican Project, Morgridge Institute for Research
  * SPDX-License-Identifier: Apache-2.0
  */
 
 #include <stdlib.h>
+#include <string.h>
 
 #include "bridge.h"
 #include "_cgo_export.h"
@@ -36,15 +38,33 @@ pelicanc_error_alloc(void)
 }
 
 pelican_result *
-pelicanc_result_alloc(size_t n)
+pelicanc_result_alloc(void)
 {
-    return calloc(n, sizeof(pelican_result));
+    return calloc(1, sizeof(pelican_result));
+}
+
+pelican_result_list *
+pelicanc_result_list_alloc(size_t n)
+{
+    pelican_result_list *list = calloc(1, sizeof(*list));
+    if (list && n > 0)
+        list->items = calloc(n, sizeof(pelican_result *));
+    return list;
 }
 
 pelican_file_info *
-pelicanc_file_info_alloc(size_t n)
+pelicanc_file_info_alloc(void)
 {
-    return calloc(n, sizeof(pelican_file_info));
+    return calloc(1, sizeof(pelican_file_info));
+}
+
+pelican_file_info_list *
+pelicanc_file_info_list_alloc(size_t n)
+{
+    pelican_file_info_list *list = calloc(1, sizeof(*list));
+    if (list && n > 0)
+        list->items = calloc(n, sizeof(pelican_file_info *));
+    return list;
 }
 
 struct pelican_context *
@@ -53,9 +73,39 @@ pelicanc_context_alloc(void)
     return calloc(1, sizeof(struct pelican_context));
 }
 
+struct pelican_transfer *
+pelicanc_transfer_alloc(void)
+{
+    return calloc(1, sizeof(struct pelican_transfer));
+}
+
+struct pelican_file *
+pelicanc_file_alloc(void)
+{
+    return calloc(1, sizeof(struct pelican_file));
+}
+
 /* ------------------------------------------------------------------ *
- * Public API: deallocation (pure C)                                  *
+ * Errors                                                             *
  * ------------------------------------------------------------------ */
+
+const char *
+pelican_error_message(const pelican_error *err)
+{
+    return err->message;
+}
+
+int
+pelican_error_is_retryable(const pelican_error *err)
+{
+    return err->retryable;
+}
+
+int
+pelican_error_code(const pelican_error *err)
+{
+    return err->code;
+}
 
 void
 pelican_error_free(pelican_error *err)
@@ -66,18 +116,163 @@ pelican_error_free(pelican_error *err)
     free(err);
 }
 
+/* ------------------------------------------------------------------ *
+ * Transfer options                                                   *
+ * ------------------------------------------------------------------ */
+
+pelican_transfer_opts *
+pelican_transfer_opts_new(void)
+{
+    return calloc(1, sizeof(pelican_transfer_opts));
+}
+
 void
-pelican_results_free(pelican_result *results, size_t n)
+pelican_transfer_opts_free(pelican_transfer_opts *opts)
+{
+    if (!opts)
+        return;
+    free(opts->token);
+    free(opts->token_location);
+    free(opts);
+}
+
+static void
+set_string_field(char **field, const char *value)
+{
+    free(*field);
+    *field = value ? strdup(value) : NULL;
+}
+
+void
+pelican_transfer_opts_set_token(pelican_transfer_opts *opts,
+                                const char *token)
+{
+    set_string_field(&opts->token, token);
+}
+
+void
+pelican_transfer_opts_set_token_location(pelican_transfer_opts *opts,
+                                         const char *path)
+{
+    set_string_field(&opts->token_location, path);
+}
+
+void
+pelican_transfer_opts_set_recursive(pelican_transfer_opts *opts,
+                                    int recursive)
+{
+    opts->recursive = recursive;
+}
+
+void
+pelican_transfer_opts_set_progress(pelican_transfer_opts *opts,
+                                   pelican_progress_fn fn, void *user_data)
+{
+    opts->progress = fn;
+    opts->progress_data = fn ? user_data : NULL;
+}
+
+/* ------------------------------------------------------------------ *
+ * Results                                                            *
+ * ------------------------------------------------------------------ */
+
+const char *
+pelican_result_source(const pelican_result *res)
+{
+    return res->source;
+}
+
+long long
+pelican_result_transferred_bytes(const pelican_result *res)
+{
+    return res->transferred_bytes;
+}
+
+const char *
+pelican_result_endpoint(const pelican_result *res)
+{
+    return res->endpoint;
+}
+
+double
+pelican_result_transfer_time_s(const pelican_result *res)
+{
+    return res->transfer_time_s;
+}
+
+int
+pelican_result_attempts(const pelican_result *res)
+{
+    return res->attempts;
+}
+
+const pelican_error *
+pelican_result_error(const pelican_result *res)
+{
+    return res->error;
+}
+
+void
+pelican_result_free(pelican_result *res)
+{
+    if (!res)
+        return;
+    free(res->source);
+    free(res->endpoint);
+    pelican_error_free(res->error);
+    free(res);
+}
+
+size_t
+pelican_result_list_count(const pelican_result_list *list)
+{
+    return list->count;
+}
+
+const pelican_result *
+pelican_result_list_get(const pelican_result_list *list, size_t i)
+{
+    return i < list->count ? list->items[i] : NULL;
+}
+
+void
+pelican_result_list_free(pelican_result_list *list)
 {
     size_t i;
-    if (!results)
+    if (!list)
         return;
-    for (i = 0; i < n; i++) {
-        free(results[i].source);
-        free(results[i].endpoint);
-        pelican_error_free(results[i].error);
-    }
-    free(results);
+    for (i = 0; i < list->count; i++)
+        pelican_result_free(list->items[i]);
+    free(list->items);
+    free(list);
+}
+
+/* ------------------------------------------------------------------ *
+ * File info                                                          *
+ * ------------------------------------------------------------------ */
+
+const char *
+pelican_file_info_name(const pelican_file_info *info)
+{
+    return info->name;
+}
+
+long long
+pelican_file_info_size(const pelican_file_info *info)
+{
+    return info->size;
+}
+
+long long
+pelican_file_info_mtime(const pelican_file_info *info)
+{
+    return info->mtime;
+}
+
+int
+pelican_file_info_is_collection(const pelican_file_info *info)
+{
+    return info->is_collection;
 }
 
 void
@@ -89,19 +284,72 @@ pelican_file_info_free(pelican_file_info *info)
     free(info);
 }
 
+size_t
+pelican_file_info_list_count(const pelican_file_info_list *list)
+{
+    return list->count;
+}
+
+const pelican_file_info *
+pelican_file_info_list_get(const pelican_file_info_list *list, size_t i)
+{
+    return i < list->count ? list->items[i] : NULL;
+}
+
 void
-pelican_file_info_list_free(pelican_file_info *infos, size_t n)
+pelican_file_info_list_free(pelican_file_info_list *list)
 {
     size_t i;
-    if (!infos)
+    if (!list)
         return;
-    for (i = 0; i < n; i++)
-        free(infos[i].name);
-    free(infos);
+    for (i = 0; i < list->count; i++)
+        pelican_file_info_free(list->items[i]);
+    free(list->items);
+    free(list);
 }
 
 /* ------------------------------------------------------------------ *
- * Public API: forwarders into the Go implementation                  *
+ * Asynchronous transfer accessors                                    *
+ * ------------------------------------------------------------------ */
+
+int
+pelican_transfer_notify_fd(const pelican_transfer *xfer)
+{
+    return xfer->notify_fd;
+}
+
+int
+pelican_transfer_next_result(pelican_transfer *xfer, pelican_result **res)
+{
+    return pelicanc_transfer_next_result(xfer, res);
+}
+
+int
+pelican_transfer_is_done(const pelican_transfer *xfer)
+{
+    return pelicanc_transfer_is_done((pelican_transfer *)xfer);
+}
+
+const pelican_error *
+pelican_transfer_error(const pelican_transfer *xfer)
+{
+    return pelicanc_transfer_error((pelican_transfer *)xfer);
+}
+
+void
+pelican_transfer_cancel(pelican_transfer *xfer)
+{
+    pelicanc_transfer_cancel(xfer);
+}
+
+void
+pelican_transfer_free(pelican_transfer *xfer)
+{
+    pelicanc_transfer_free(xfer);
+}
+
+/* ------------------------------------------------------------------ *
+ * Forwarders into the Go implementation                              *
  * ------------------------------------------------------------------ */
 
 pelican_error *
@@ -143,19 +391,35 @@ pelican_context_free(pelican_context *ctx)
 pelican_error *
 pelican_get(pelican_context *ctx, const char *remote_url,
             const char *local_path, const pelican_transfer_opts *opts,
-            pelican_result **results, size_t *n_results)
+            pelican_result_list **results)
 {
     return pelicanc_get(ctx, (char *)remote_url, (char *)local_path,
-                        (pelican_transfer_opts *)opts, results, n_results);
+                        (pelican_transfer_opts *)opts, results);
 }
 
 pelican_error *
 pelican_put(pelican_context *ctx, const char *local_path,
             const char *remote_url, const pelican_transfer_opts *opts,
-            pelican_result **results, size_t *n_results)
+            pelican_result_list **results)
 {
     return pelicanc_put(ctx, (char *)local_path, (char *)remote_url,
-                        (pelican_transfer_opts *)opts, results, n_results);
+                        (pelican_transfer_opts *)opts, results);
+}
+
+pelican_error *
+pelican_get_start(const char *remote_url, const char *local_path,
+                  const pelican_transfer_opts *opts, pelican_transfer **xfer)
+{
+    return pelicanc_get_start((char *)remote_url, (char *)local_path,
+                              (pelican_transfer_opts *)opts, xfer);
+}
+
+pelican_error *
+pelican_put_start(const char *local_path, const char *remote_url,
+                  const pelican_transfer_opts *opts, pelican_transfer **xfer)
+{
+    return pelicanc_put_start((char *)local_path, (char *)remote_url,
+                              (pelican_transfer_opts *)opts, xfer);
 }
 
 pelican_error *
@@ -168,11 +432,11 @@ pelican_stat(pelican_context *ctx, const char *remote_url,
 
 pelican_error *
 pelican_list(pelican_context *ctx, const char *remote_url,
-             const pelican_transfer_opts *opts, pelican_file_info **infos,
-             size_t *n_infos)
+             const pelican_transfer_opts *opts,
+             pelican_file_info_list **entries)
 {
     return pelicanc_list(ctx, (char *)remote_url,
-                         (pelican_transfer_opts *)opts, infos, n_infos);
+                         (pelican_transfer_opts *)opts, entries);
 }
 
 pelican_error *
@@ -181,4 +445,56 @@ pelican_delete(pelican_context *ctx, const char *remote_url,
 {
     return pelicanc_delete(ctx, (char *)remote_url,
                            (pelican_transfer_opts *)opts);
+}
+
+/* ------------------------------------------------------------------ *
+ * File I/O forwarders                                                *
+ * ------------------------------------------------------------------ */
+
+pelican_error *
+pelican_fs_open(const char *remote_url, int flags,
+                const pelican_transfer_opts *opts, pelican_file **file)
+{
+    return pelicanc_fs_open((char *)remote_url, flags,
+                            (pelican_transfer_opts *)opts, file);
+}
+
+long long
+pelican_file_read(pelican_file *file, void *buf, size_t len,
+                  pelican_error **err)
+{
+    return pelicanc_file_read(file, buf, len, err);
+}
+
+long long
+pelican_file_pread(pelican_file *file, void *buf, size_t len,
+                   long long offset, pelican_error **err)
+{
+    return pelicanc_file_pread(file, buf, len, offset, err);
+}
+
+long long
+pelican_file_write(pelican_file *file, const void *buf, size_t len,
+                   pelican_error **err)
+{
+    return pelicanc_file_write(file, (void *)buf, len, err);
+}
+
+long long
+pelican_file_seek(pelican_file *file, long long offset, int whence,
+                  pelican_error **err)
+{
+    return pelicanc_file_seek(file, offset, whence, err);
+}
+
+pelican_error *
+pelican_file_stat(pelican_file *file, pelican_file_info **info)
+{
+    return pelicanc_file_stat(file, info);
+}
+
+pelican_error *
+pelican_file_close(pelican_file *file)
+{
+    return pelicanc_file_close(file);
 }

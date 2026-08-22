@@ -10,51 +10,99 @@ The library is a cgo `c-shared` build: the Go client from
 compiled into a single `libpelicanclient` shared library exposing the
 C API declared in [`include/pelican/client.h`](include/pelican/client.h).
 
+Every type in the API is opaque — all access goes through getter/setter
+functions, so struct layouts are never part of the ABI.
+
 ## Building
 
 Requires Go ≥ 1.26 and a C compiler.
 
 ```sh
 make            # builds build/libpelicanclient.{so,dylib}
-make example    # builds the example client
+make example    # builds the example clients
 make test       # offline smoke test
 ```
 
-## Quick start
+## Quick start (synchronous)
 
 ```c
 #include <pelican/client.h>
 
 pelican_error *err = pelican_client_init(NULL);
-if (err) { /* err->message, err->retryable; pelican_error_free(err) */ }
+if (err) { /* pelican_error_message(err), ..._is_retryable(err) */ }
 
-pelican_result *results; size_t n;
+pelican_result_list *results;
 err = pelican_get(NULL,
         "pelican://osg-htc.org/ospool/uc-shared/public/OSG-Staff/validation/test.txt",
-        "/tmp/test.txt", NULL, &results, &n);
+        "/tmp/test.txt", NULL, &results);
 ...
-pelican_results_free(results, n);
+pelican_result_list_free(results);
 ```
 
-See [`examples/pelican_example.c`](examples/pelican_example.c) for stat,
-list, progress callbacks, and cancellation contexts, and
-[`docs/design.md`](docs/design.md) for the architecture and API
-conventions.
+## Asynchronous transfers for event loops
+
+Designed for single-threaded, fd-driven daemons (HTCondor DaemonCore):
+`pelican_get_start`/`pelican_put_start` return immediately, per-object
+results stream as they complete (never buffered into one long list), and
+a notification fd — suitable for `Register_Pipe`, `poll`, `epoll`, or
+`kqueue` — becomes readable whenever there is something to collect.  No
+call in the async API blocks.
+
+```c
+pelican_transfer *xfer;
+err = pelican_get_start(url, local_path, NULL, &xfer);
+register_fd(pelican_transfer_notify_fd(xfer));   /* your event loop */
+
+/* fd-readable handler: */
+pelican_result *res;
+while (pelican_transfer_next_result(xfer, &res)) {
+    /* pelican_result_source/transferred_bytes/endpoint/error ... */
+    pelican_result_free(res);
+}
+if (pelican_transfer_is_done(xfer)) {
+    const pelican_error *terr = pelican_transfer_error(xfer);
+    /* handle terr, then: */
+    pelican_transfer_free(xfer);
+}
+```
+
+## File I/O (PelicanFS)
+
+Remote objects can be read and written directly — sequential reads,
+positional `pread` (HTTP range requests under the hood), seek, and
+streamed uploads — without staging through local disk:
+
+```c
+pelican_file *f;
+err = pelican_fs_open(url, PELICAN_O_RDONLY, NULL, &f);
+long long n = pelican_file_pread(f, buf, sizeof(buf), offset, &err);
+err = pelican_file_close(f);
+```
+
+These calls block on network I/O; from an event loop, use them where
+blocking is acceptable or on worker threads/processes.
+
+See [`examples/`](examples/) for complete programs and
+[`docs/design.md`](docs/design.md) for the architecture, the
+notification-fd protocol, and API conventions.
 
 ## API overview
 
-| Function | Purpose |
+| Area | Functions |
 | --- | --- |
-| `pelican_client_init` / `pelican_config_set` | one-time library setup |
-| `pelican_get` / `pelican_put` | object download / upload, with per-object results |
-| `pelican_stat` / `pelican_list` / `pelican_delete` | namespace operations |
-| `pelican_context_new` / `_cancel` / `_free` | cross-thread cancellation |
-| `pelican_error_free`, `pelican_results_free`, … | deallocation |
+| Setup | `pelican_client_init`, `pelican_config_set`, `pelican_version` |
+| Options | `pelican_transfer_opts_new/_free`, `..._set_token`, `..._set_token_location`, `..._set_recursive`, `..._set_progress` |
+| Sync transfers | `pelican_get`, `pelican_put` (+ `pelican_result_list_*` accessors) |
+| Async transfers | `pelican_get_start`, `pelican_put_start`, `pelican_transfer_notify_fd`, `..._next_result`, `..._is_done`, `..._error`, `..._cancel`, `..._free` |
+| Namespace | `pelican_stat`, `pelican_list`, `pelican_delete` (+ `pelican_file_info_*` accessors) |
+| File I/O | `pelican_fs_open`, `pelican_file_read/_pread/_write/_seek/_stat/_close` |
+| Errors | `pelican_error_message`, `..._is_retryable`, `..._code`, `..._free` |
 
 Every fallible call returns a `pelican_error *` (NULL on success) carrying
-a human-readable message and a `retryable` flag derived from the client's
+a human-readable message, a `retryable` flag derived from the client's
 error classification — the flag HTCondor needs for its transfer-plugin
-retry decisions.
+retry decisions — and, when classified, the numeric code from the Pelican
+error taxonomy (e.g. 5011 for object-not-found).
 
 ## Notes for HTCondor integration
 
@@ -66,6 +114,8 @@ retry decisions.
 - Tokens can be passed per-operation (contents or file path) via
   `pelican_transfer_opts`; token discovery (e.g. `BEARER_TOKEN_FILE`,
   WLCG bearer-token conventions) otherwise applies.
+- Progress callbacks fire on library-owned threads; single-threaded
+  daemons should prefer the async API's notification fd.
 - **Fork caution:** the Go runtime starts threads when the library is
   loaded. A `fork()` without `exec()` leaves the child's copy of the
   runtime unusable — load and use the library only in the process that

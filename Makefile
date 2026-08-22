@@ -13,6 +13,7 @@ endif
 BUILDDIR := build
 LIB      := $(BUILDDIR)/libpelicanclient.$(SOEXT)
 EXAMPLE  := $(BUILDDIR)/pelican_example
+ASYNC_EXAMPLE := $(BUILDDIR)/pelican_async_example
 
 GO_SOURCES := $(wildcard *.go) bridge.c bridge.h include/pelican/client.h go.mod go.sum
 
@@ -30,14 +31,18 @@ ifeq ($(UNAME_S),Darwin)
 	install_name_tool -id @rpath/libpelicanclient.dylib $@
 endif
 
-example: $(EXAMPLE)
+example: $(EXAMPLE) $(ASYNC_EXAMPLE)
 
 $(EXAMPLE): $(LIB) examples/pelican_example.c
 	$(CC) -Wall -Wextra -o $@ examples/pelican_example.c -Iinclude \
 	    -L$(BUILDDIR) -lpelicanclient -Wl,-rpath,$(abspath $(BUILDDIR))
 
+$(ASYNC_EXAMPLE): $(LIB) examples/pelican_async_example.c
+	$(CC) -Wall -Wextra -o $@ examples/pelican_async_example.c -Iinclude \
+	    -L$(BUILDDIR) -lpelicanclient -Wl,-rpath,$(abspath $(BUILDDIR))
+
 # Offline smoke test: version string, init, and an error-path check.
-test: $(EXAMPLE)
+test: $(EXAMPLE) $(ASYNC_EXAMPLE)
 	./$(EXAMPLE)
 
 clean:

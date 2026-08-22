@@ -19,9 +19,10 @@
 // Package main implements the cgo shim behind libpelicanclient.
 //
 // The exported functions here use internal `pelicanc_*` names; the public,
-// const-correct entry points declared in include/pelican/client.h are thin
-// forwarding wrappers defined in bridge.c.  Keep the three layers in sync:
-// client.h (public ABI), bridge.c (wrappers), this file (implementation).
+// const-correct entry points declared in include/pelican/client.h are
+// defined in bridge.c — pure C for accessors and deallocation, thin
+// forwarders into this file for everything else.  Keep the three layers
+// in sync: client.h (public ABI), bridge.c (wrappers), this file.
 package main
 
 /*
@@ -33,15 +34,22 @@ import "C"
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
+	"io/fs"
+	"net/url"
+	"os"
 	"runtime/cgo"
 	"runtime/debug"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"unsafe"
 
 	"github.com/pelicanplatform/pelican/client"
 	"github.com/pelicanplatform/pelican/config"
+	"github.com/pelicanplatform/pelican/error_codes"
 	"github.com/spf13/viper"
 )
 
@@ -50,6 +58,9 @@ var (
 	initialized atomic.Bool
 	versionOnce sync.Once
 	versionCStr *C.char
+	engineOnce  sync.Once
+	engine      *client.TransferEngine
+	engineErr   error
 )
 
 // makeError converts a Go error into a caller-owned pelican_error.
@@ -61,6 +72,10 @@ func makeError(err error) *C.pelican_error {
 	ce.message = C.CString(err.Error())
 	if client.ShouldRetry(err) {
 		ce.retryable = 1
+	}
+	var pe *error_codes.PelicanError
+	if errors.As(err, &pe) {
+		ce.code = C.int(pe.Code())
 	}
 	return ce
 }
@@ -83,8 +98,17 @@ func requireInit() error {
 	return nil
 }
 
+// getEngine lazily starts the shared TransferEngine backing the
+// asynchronous API.  It lives for the remainder of the process.
+func getEngine() (*client.TransferEngine, error) {
+	engineOnce.Do(func() {
+		engine, engineErr = client.NewTransferEngine(context.Background())
+	})
+	return engine, engineErr
+}
+
 // goCtxFor resolves the optional C cancellation handle to a Go context.
-func goCtxFor(cctx *C.struct_pelican_context) context.Context {
+func goCtxFor(cctx *C.pelican_context) context.Context {
 	if cctx == nil || cctx.handle == 0 {
 		return context.Background()
 	}
@@ -153,38 +177,42 @@ func init() {
 	}
 }
 
-// fillResults converts per-object transfer results into a C array.
-// fallbackSource covers download results, which (unlike the error path)
-// are produced without TransferResults.Source populated.
-func fillResults(results []client.TransferResults, fallbackSource string, cresults **C.pelican_result, nresults *C.size_t) {
-	if cresults == nil || nresults == nil {
-		return
+// makeCResult converts one per-object transfer result.  fallbackSource
+// covers download results, which (unlike the error path) are produced
+// without TransferResults.Source populated.
+func makeCResult(r *client.TransferResults, fallbackSource string) *C.pelican_result {
+	res := C.pelicanc_result_alloc()
+	source := r.Source
+	if source == "" {
+		source = fallbackSource
 	}
-	*cresults = nil
-	*nresults = 0
-	if len(results) == 0 {
-		return
+	res.source = C.CString(source)
+	res.transferred_bytes = C.longlong(r.TransferredBytes)
+	res.attempts = C.int(len(r.Attempts))
+	if n := len(r.Attempts); n > 0 {
+		last := r.Attempts[n-1]
+		res.endpoint = C.CString(last.Endpoint)
+		res.transfer_time_s = C.double(last.TransferTime.Seconds())
 	}
-	arr := C.pelicanc_result_alloc(C.size_t(len(results)))
-	slice := unsafe.Slice(arr, len(results))
-	for i, r := range results {
-		source := r.Source
-		if source == "" {
-			source = fallbackSource
-		}
-		slice[i].source = C.CString(source)
-		slice[i].transferred_bytes = C.longlong(r.TransferredBytes)
-		slice[i].attempts = C.int(len(r.Attempts))
-		if n := len(r.Attempts); n > 0 {
-			last := r.Attempts[n-1]
-			slice[i].endpoint = C.CString(last.Endpoint)
-			slice[i].transfer_time_s = C.double(last.TransferTime.Seconds())
-		}
-		slice[i].error = makeError(r.Error)
-	}
-	*cresults = arr
-	*nresults = C.size_t(len(results))
+	res.error = makeError(r.Error)
+	return res
 }
+
+func makeResultList(results []client.TransferResults, fallbackSource string) *C.pelican_result_list {
+	list := C.pelicanc_result_list_alloc(C.size_t(len(results)))
+	if len(results) > 0 {
+		items := unsafe.Slice(list.items, len(results))
+		for i := range results {
+			items[i] = makeCResult(&results[i], fallbackSource)
+		}
+		list.count = C.size_t(len(results))
+	}
+	return list
+}
+
+/* ------------------------------------------------------------------ *
+ * Library setup                                                      *
+ * ------------------------------------------------------------------ */
 
 //export pelicanc_config_set
 func pelicanc_config_set(key, value *C.char) *C.pelican_error {
@@ -238,8 +266,12 @@ func pelicanc_version() *C.char {
 	return versionCStr
 }
 
+/* ------------------------------------------------------------------ *
+ * Cancellation contexts                                              *
+ * ------------------------------------------------------------------ */
+
 //export pelicanc_context_new
-func pelicanc_context_new() *C.struct_pelican_context {
+func pelicanc_context_new() *C.pelican_context {
 	cctx := C.pelicanc_context_alloc()
 	ctx, cancel := context.WithCancel(context.Background())
 	cctx.handle = C.uintptr_t(cgo.NewHandle(&cancelContext{ctx: ctx, cancel: cancel}))
@@ -247,7 +279,7 @@ func pelicanc_context_new() *C.struct_pelican_context {
 }
 
 //export pelicanc_context_cancel
-func pelicanc_context_cancel(cctx *C.struct_pelican_context) {
+func pelicanc_context_cancel(cctx *C.pelican_context) {
 	if cctx == nil || cctx.handle == 0 {
 		return
 	}
@@ -255,7 +287,7 @@ func pelicanc_context_cancel(cctx *C.struct_pelican_context) {
 }
 
 //export pelicanc_context_free
-func pelicanc_context_free(cctx *C.struct_pelican_context) {
+func pelicanc_context_free(cctx *C.pelican_context) {
 	if cctx == nil {
 		return
 	}
@@ -267,8 +299,12 @@ func pelicanc_context_free(cctx *C.struct_pelican_context) {
 	C.free(unsafe.Pointer(cctx))
 }
 
+/* ------------------------------------------------------------------ *
+ * Synchronous transfers                                              *
+ * ------------------------------------------------------------------ */
+
 //export pelicanc_get
-func pelicanc_get(cctx *C.struct_pelican_context, remoteUrl, localPath *C.char, copts *C.pelican_transfer_opts, cresults **C.pelican_result, nresults *C.size_t) *C.pelican_error {
+func pelicanc_get(cctx *C.pelican_context, remoteUrl, localPath *C.char, copts *C.pelican_transfer_opts, listOut **C.pelican_result_list) *C.pelican_error {
 	return guard(func() *C.pelican_error {
 		if err := requireInit(); err != nil {
 			return makeError(err)
@@ -276,13 +312,15 @@ func pelicanc_get(cctx *C.struct_pelican_context, remoteUrl, localPath *C.char, 
 		opts, recursive := buildOptions(copts)
 		remote := C.GoString(remoteUrl)
 		results, err := client.DoGet(goCtxFor(cctx), remote, C.GoString(localPath), recursive, opts...)
-		fillResults(results, remote, cresults, nresults)
+		if listOut != nil {
+			*listOut = makeResultList(results, remote)
+		}
 		return makeError(err)
 	})
 }
 
 //export pelicanc_put
-func pelicanc_put(cctx *C.struct_pelican_context, localPath, remoteUrl *C.char, copts *C.pelican_transfer_opts, cresults **C.pelican_result, nresults *C.size_t) *C.pelican_error {
+func pelicanc_put(cctx *C.pelican_context, localPath, remoteUrl *C.char, copts *C.pelican_transfer_opts, listOut **C.pelican_result_list) *C.pelican_error {
 	return guard(func() *C.pelican_error {
 		if err := requireInit(); err != nil {
 			return makeError(err)
@@ -290,22 +328,267 @@ func pelicanc_put(cctx *C.struct_pelican_context, localPath, remoteUrl *C.char, 
 		opts, recursive := buildOptions(copts)
 		remote := C.GoString(remoteUrl)
 		results, err := client.DoPut(goCtxFor(cctx), C.GoString(localPath), remote, recursive, opts...)
-		fillResults(results, remote, cresults, nresults)
+		if listOut != nil {
+			*listOut = makeResultList(results, remote)
+		}
 		return makeError(err)
 	})
 }
 
-func fillFileInfo(dst *C.pelican_file_info, src *client.FileInfo) {
-	dst.name = C.CString(src.Name)
-	dst.size = C.longlong(src.Size)
-	dst.mtime = C.longlong(src.ModTime.Unix())
-	if src.IsCollection {
+/* ------------------------------------------------------------------ *
+ * Asynchronous transfers                                             *
+ * ------------------------------------------------------------------ */
+
+// transferState is the Go side of a pelican_transfer.  Completed results
+// queue here; a byte written to the self-pipe wakes the host's event
+// loop.  The pipe is drained only when the queue is observed empty, so
+// readability is level-triggered: readable ⇒ call next_result until it
+// reports nothing pending.
+type transferState struct {
+	mu      sync.Mutex
+	queue   []*C.pelican_result
+	done    bool
+	freed   bool
+	termErr *C.pelican_error
+	readFd  int
+	writeFd int
+	cancel  context.CancelFunc
+	tc      *client.TransferClient
+}
+
+// wake writes one byte to the notification pipe.  Callers hold mu.  A
+// full pipe returns EAGAIN, which is fine — the fd is already readable.
+func (ts *transferState) wake() {
+	_, _ = syscall.Write(ts.writeFd, []byte{1})
+}
+
+// drainPipe empties the notification pipe.  Callers hold mu and have
+// observed an empty queue; any concurrent enqueue re-arms the pipe
+// after we release the lock.
+func (ts *transferState) drainPipe() {
+	buf := make([]byte, 256)
+	for {
+		n, err := syscall.Read(ts.readFd, buf)
+		if n <= 0 || err != nil {
+			return
+		}
+	}
+}
+
+func (ts *transferState) enqueue(res *C.pelican_result) {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	if ts.freed {
+		C.pelican_result_free(res)
+		return
+	}
+	ts.queue = append(ts.queue, res)
+	ts.wake()
+}
+
+func (ts *transferState) finish(err error) {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	if ts.freed {
+		return
+	}
+	ts.done = true
+	ts.termErr = makeError(err)
+	ts.wake()
+}
+
+func transferStateFor(cxfer *C.pelican_transfer) *transferState {
+	return cgo.Handle(cxfer.handle).Value().(*transferState)
+}
+
+// runTransfer is the goroutine driving one asynchronous transfer,
+// streaming per-object results into the state as the engine produces
+// them.
+func runTransfer(ctx context.Context, ts *transferState, te *client.TransferEngine, remote, local string, upload, recursive bool, opts []client.TransferOption) {
+	defer func() {
+		if r := recover(); r != nil {
+			ts.finish(fmt.Errorf("panic in pelican transfer: %v", r))
+		}
+	}()
+	pUrl, err := client.ParseRemoteAsPUrl(ctx, remote)
+	if err != nil {
+		ts.finish(err)
+		return
+	}
+	tc, err := te.NewClient(opts...)
+	if err != nil {
+		ts.finish(err)
+		return
+	}
+	ts.mu.Lock()
+	if ts.freed {
+		ts.mu.Unlock()
+		tc.Cancel()
+		return
+	}
+	ts.tc = tc
+	ts.mu.Unlock()
+	tj, err := tc.NewTransferJob(ctx, pUrl.GetRawUrl(), local, upload, recursive, opts...)
+	if err != nil {
+		tc.Close()
+		ts.finish(err)
+		return
+	}
+	if err := tc.Submit(tj); err != nil {
+		tc.Close()
+		ts.finish(err)
+		return
+	}
+	tc.Close()
+	for r := range tc.Results() {
+		ts.enqueue(makeCResult(&r, remote))
+	}
+	_, lookupErr := tj.GetLookupStatus()
+	if lookupErr == nil {
+		lookupErr = ctx.Err()
+	}
+	ts.finish(lookupErr)
+}
+
+func startTransfer(remote, local string, upload bool, copts *C.pelican_transfer_opts, out **C.pelican_transfer) *C.pelican_error {
+	return guard(func() *C.pelican_error {
+		if err := requireInit(); err != nil {
+			return makeError(err)
+		}
+		if out == nil {
+			return makeError(fmt.Errorf("output transfer pointer may not be NULL"))
+		}
+		*out = nil
+		te, err := getEngine()
+		if err != nil {
+			return makeError(fmt.Errorf("failed to start transfer engine: %w", err))
+		}
+		var fds [2]int
+		if err := syscall.Pipe(fds[:]); err != nil {
+			return makeError(fmt.Errorf("failed to create notification pipe: %w", err))
+		}
+		for _, fd := range fds {
+			_ = syscall.SetNonblock(fd, true)
+			syscall.CloseOnExec(fd)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		ts := &transferState{readFd: fds[0], writeFd: fds[1], cancel: cancel}
+		cxfer := C.pelicanc_transfer_alloc()
+		cxfer.handle = C.uintptr_t(cgo.NewHandle(ts))
+		cxfer.notify_fd = C.int(fds[0])
+		opts, recursive := buildOptions(copts)
+		go runTransfer(ctx, ts, te, remote, local, upload, recursive, opts)
+		*out = cxfer
+		return nil
+	})
+}
+
+//export pelicanc_get_start
+func pelicanc_get_start(remoteUrl, localPath *C.char, copts *C.pelican_transfer_opts, out **C.pelican_transfer) *C.pelican_error {
+	return startTransfer(C.GoString(remoteUrl), C.GoString(localPath), false, copts, out)
+}
+
+//export pelicanc_put_start
+func pelicanc_put_start(localPath, remoteUrl *C.char, copts *C.pelican_transfer_opts, out **C.pelican_transfer) *C.pelican_error {
+	return startTransfer(C.GoString(remoteUrl), C.GoString(localPath), true, copts, out)
+}
+
+//export pelicanc_transfer_next_result
+func pelicanc_transfer_next_result(cxfer *C.pelican_transfer, res **C.pelican_result) C.int {
+	ts := transferStateFor(cxfer)
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	if len(ts.queue) > 0 {
+		popped := ts.queue[0]
+		ts.queue = ts.queue[1:]
+		if res != nil {
+			*res = popped
+		} else {
+			C.pelican_result_free(popped)
+		}
+		return 1
+	}
+	// Nothing pending: quiesce the notification fd.  A result or the
+	// completion event arriving after this drain re-arms it, because
+	// producers write their wake byte under the same lock.
+	ts.drainPipe()
+	return 0
+}
+
+//export pelicanc_transfer_is_done
+func pelicanc_transfer_is_done(cxfer *C.pelican_transfer) C.int {
+	ts := transferStateFor(cxfer)
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	if ts.done {
+		return 1
+	}
+	return 0
+}
+
+//export pelicanc_transfer_error
+func pelicanc_transfer_error(cxfer *C.pelican_transfer) *C.pelican_error {
+	ts := transferStateFor(cxfer)
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	return ts.termErr
+}
+
+//export pelicanc_transfer_cancel
+func pelicanc_transfer_cancel(cxfer *C.pelican_transfer) {
+	if cxfer == nil || cxfer.handle == 0 {
+		return
+	}
+	ts := transferStateFor(cxfer)
+	ts.mu.Lock()
+	cancel, tc := ts.cancel, ts.tc
+	ts.mu.Unlock()
+	cancel()
+	if tc != nil {
+		tc.Cancel()
+	}
+}
+
+//export pelicanc_transfer_free
+func pelicanc_transfer_free(cxfer *C.pelican_transfer) {
+	if cxfer == nil {
+		return
+	}
+	if cxfer.handle != 0 {
+		pelicanc_transfer_cancel(cxfer)
+		h := cgo.Handle(cxfer.handle)
+		ts := h.Value().(*transferState)
+		ts.mu.Lock()
+		ts.freed = true
+		for _, r := range ts.queue {
+			C.pelican_result_free(r)
+		}
+		ts.queue = nil
+		C.pelican_error_free(ts.termErr)
+		ts.termErr = nil
+		_ = syscall.Close(ts.readFd)
+		_ = syscall.Close(ts.writeFd)
+		ts.mu.Unlock()
+		h.Delete()
+	}
+	C.free(unsafe.Pointer(cxfer))
+}
+
+/* ------------------------------------------------------------------ *
+ * Namespace operations                                               *
+ * ------------------------------------------------------------------ */
+
+func fillFileInfo(dst *C.pelican_file_info, name string, size int64, mtime int64, isCollection bool) {
+	dst.name = C.CString(name)
+	dst.size = C.longlong(size)
+	dst.mtime = C.longlong(mtime)
+	if isCollection {
 		dst.is_collection = 1
 	}
 }
 
 //export pelicanc_stat
-func pelicanc_stat(cctx *C.struct_pelican_context, remoteUrl *C.char, copts *C.pelican_transfer_opts, cinfo **C.pelican_file_info) *C.pelican_error {
+func pelicanc_stat(cctx *C.pelican_context, remoteUrl *C.char, copts *C.pelican_transfer_opts, cinfo **C.pelican_file_info) *C.pelican_error {
 	return guard(func() *C.pelican_error {
 		if err := requireInit(); err != nil {
 			return makeError(err)
@@ -319,44 +602,44 @@ func pelicanc_stat(cctx *C.struct_pelican_context, remoteUrl *C.char, copts *C.p
 		if err != nil {
 			return makeError(err)
 		}
-		out := C.pelicanc_file_info_alloc(1)
-		fillFileInfo(out, info)
+		out := C.pelicanc_file_info_alloc()
+		fillFileInfo(out, info.Name, info.Size, info.ModTime.Unix(), info.IsCollection)
 		*cinfo = out
 		return nil
 	})
 }
 
 //export pelicanc_list
-func pelicanc_list(cctx *C.struct_pelican_context, remoteUrl *C.char, copts *C.pelican_transfer_opts, cinfos **C.pelican_file_info, ninfos *C.size_t) *C.pelican_error {
+func pelicanc_list(cctx *C.pelican_context, remoteUrl *C.char, copts *C.pelican_transfer_opts, listOut **C.pelican_file_info_list) *C.pelican_error {
 	return guard(func() *C.pelican_error {
 		if err := requireInit(); err != nil {
 			return makeError(err)
 		}
-		if cinfos == nil || ninfos == nil {
-			return makeError(fmt.Errorf("output file info pointers may not be NULL"))
+		if listOut == nil {
+			return makeError(fmt.Errorf("output list pointer may not be NULL"))
 		}
-		*cinfos = nil
-		*ninfos = 0
+		*listOut = nil
 		opts, _ := buildOptions(copts)
 		infos, err := client.DoList(goCtxFor(cctx), C.GoString(remoteUrl), opts...)
 		if err != nil {
 			return makeError(err)
 		}
+		list := C.pelicanc_file_info_list_alloc(C.size_t(len(infos)))
 		if len(infos) > 0 {
-			arr := C.pelicanc_file_info_alloc(C.size_t(len(infos)))
-			slice := unsafe.Slice(arr, len(infos))
+			items := unsafe.Slice(list.items, len(infos))
 			for i := range infos {
-				fillFileInfo(&slice[i], &infos[i])
+				items[i] = C.pelicanc_file_info_alloc()
+				fillFileInfo(items[i], infos[i].Name, infos[i].Size, infos[i].ModTime.Unix(), infos[i].IsCollection)
 			}
-			*cinfos = arr
-			*ninfos = C.size_t(len(infos))
+			list.count = C.size_t(len(infos))
 		}
+		*listOut = list
 		return nil
 	})
 }
 
 //export pelicanc_delete
-func pelicanc_delete(cctx *C.struct_pelican_context, remoteUrl *C.char, copts *C.pelican_transfer_opts) *C.pelican_error {
+func pelicanc_delete(cctx *C.pelican_context, remoteUrl *C.char, copts *C.pelican_transfer_opts) *C.pelican_error {
 	return guard(func() *C.pelican_error {
 		if err := requireInit(); err != nil {
 			return makeError(err)
@@ -364,6 +647,216 @@ func pelicanc_delete(cctx *C.struct_pelican_context, remoteUrl *C.char, copts *C
 		opts, recursive := buildOptions(copts)
 		return makeError(client.DoDelete(goCtxFor(cctx), C.GoString(remoteUrl), recursive, opts...))
 	})
+}
+
+/* ------------------------------------------------------------------ *
+ * File I/O (PelicanFS)                                               *
+ * ------------------------------------------------------------------ */
+
+// fileState is the Go side of a pelican_file.  Each open file owns a
+// PelicanFS instance (and thus a TransferEngine); PelicanFS exposes no
+// shutdown, so the context is cancelled on close to reap the engine's
+// goroutines.
+type fileState struct {
+	file   fs.File
+	cancel context.CancelFunc
+}
+
+func fileStateFor(cfile *C.pelican_file) *fileState {
+	return cgo.Handle(cfile.handle).Value().(*fileState)
+}
+
+func translateOpenFlags(flags C.int) (int, error) {
+	goFlags := 0
+	switch flags & 3 {
+	case C.PELICAN_O_RDONLY:
+		goFlags = os.O_RDONLY
+	case C.PELICAN_O_WRONLY:
+		goFlags = os.O_WRONLY
+	case C.PELICAN_O_RDWR:
+		goFlags = os.O_RDWR
+	default:
+		return 0, fmt.Errorf("invalid access mode in open flags %#x", int(flags))
+	}
+	remaining := flags &^ 3
+	if remaining&C.PELICAN_O_CREATE != 0 {
+		goFlags |= os.O_CREATE
+		remaining &^= C.PELICAN_O_CREATE
+	}
+	if remaining != 0 {
+		return 0, fmt.Errorf("unsupported open flags %#x", int(flags))
+	}
+	return goFlags, nil
+}
+
+//export pelicanc_fs_open
+func pelicanc_fs_open(remoteUrl *C.char, flags C.int, copts *C.pelican_transfer_opts, out **C.pelican_file) *C.pelican_error {
+	return guard(func() *C.pelican_error {
+		if err := requireInit(); err != nil {
+			return makeError(err)
+		}
+		if out == nil {
+			return makeError(fmt.Errorf("output file pointer may not be NULL"))
+		}
+		*out = nil
+		goFlags, err := translateOpenFlags(flags)
+		if err != nil {
+			return makeError(err)
+		}
+		u, err := url.Parse(C.GoString(remoteUrl))
+		if err != nil {
+			return makeError(fmt.Errorf("failed to parse remote URL: %w", err))
+		}
+		if u.Scheme == "" || u.Host == "" {
+			return makeError(fmt.Errorf("remote URL %q must include a scheme and federation host (e.g. pelican://federation/path)", u.String()))
+		}
+		opts, _ := buildOptions(copts)
+		ctx, cancel := context.WithCancel(context.Background())
+		pfs := client.NewPelicanFSWithPrefix(ctx, u.Scheme+"://"+u.Host, opts...)
+		f, err := pfs.OpenFile(u.Path, goFlags)
+		if err != nil {
+			cancel()
+			return makeError(err)
+		}
+		cfile := C.pelicanc_file_alloc()
+		cfile.handle = C.uintptr_t(cgo.NewHandle(&fileState{file: f, cancel: cancel}))
+		*out = cfile
+		return nil
+	})
+}
+
+// ioGuard wraps the read/write/seek-style exports: panics become errors,
+// and the (result, error) pair is mapped to the C convention of
+// count-or-negative-one with an optional error out-parameter.
+func ioGuard(errOut **C.pelican_error, fn func() (int64, error)) (ret C.longlong) {
+	if errOut != nil {
+		*errOut = nil
+	}
+	var n int64
+	var err error
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				err = fmt.Errorf("panic in pelican client: %v", r)
+			}
+		}()
+		n, err = fn()
+	}()
+	if err != nil {
+		if errOut != nil {
+			*errOut = makeError(err)
+		}
+		return -1
+	}
+	return C.longlong(n)
+}
+
+//export pelicanc_file_read
+func pelicanc_file_read(cfile *C.pelican_file, buf unsafe.Pointer, length C.size_t, errOut **C.pelican_error) C.longlong {
+	return ioGuard(errOut, func() (int64, error) {
+		st := fileStateFor(cfile)
+		n, err := st.file.Read(unsafe.Slice((*byte)(buf), int(length)))
+		if err == io.EOF && n == 0 {
+			return 0, nil
+		}
+		if n > 0 {
+			return int64(n), nil
+		}
+		return int64(n), err
+	})
+}
+
+//export pelicanc_file_pread
+func pelicanc_file_pread(cfile *C.pelican_file, buf unsafe.Pointer, length C.size_t, offset C.longlong, errOut **C.pelican_error) C.longlong {
+	return ioGuard(errOut, func() (int64, error) {
+		st := fileStateFor(cfile)
+		ra, ok := st.file.(io.ReaderAt)
+		if !ok {
+			return 0, fmt.Errorf("positional reads are not supported for this file")
+		}
+		n, err := ra.ReadAt(unsafe.Slice((*byte)(buf), int(length)), int64(offset))
+		if err == io.EOF && n >= 0 {
+			return int64(n), nil
+		}
+		if n > 0 {
+			return int64(n), nil
+		}
+		return int64(n), err
+	})
+}
+
+//export pelicanc_file_write
+func pelicanc_file_write(cfile *C.pelican_file, buf unsafe.Pointer, length C.size_t, errOut **C.pelican_error) C.longlong {
+	return ioGuard(errOut, func() (int64, error) {
+		st := fileStateFor(cfile)
+		w, ok := st.file.(io.Writer)
+		if !ok {
+			return 0, fmt.Errorf("file is not open for writing")
+		}
+		n, err := w.Write(unsafe.Slice((*byte)(buf), int(length)))
+		if err != nil {
+			return int64(n), err
+		}
+		return int64(n), nil
+	})
+}
+
+//export pelicanc_file_seek
+func pelicanc_file_seek(cfile *C.pelican_file, offset C.longlong, whence C.int, errOut **C.pelican_error) C.longlong {
+	return ioGuard(errOut, func() (int64, error) {
+		st := fileStateFor(cfile)
+		s, ok := st.file.(io.Seeker)
+		if !ok {
+			return 0, fmt.Errorf("seeking is not supported for this file")
+		}
+		if whence < 0 || whence > 2 {
+			return 0, fmt.Errorf("invalid whence %d", int(whence))
+		}
+		return s.Seek(int64(offset), int(whence))
+	})
+}
+
+//export pelicanc_file_stat
+func pelicanc_file_stat(cfile *C.pelican_file, cinfo **C.pelican_file_info) *C.pelican_error {
+	return guard(func() *C.pelican_error {
+		if cinfo == nil {
+			return makeError(fmt.Errorf("output file info pointer may not be NULL"))
+		}
+		*cinfo = nil
+		st := fileStateFor(cfile)
+		info, err := st.file.Stat()
+		if err != nil {
+			return makeError(err)
+		}
+		out := C.pelicanc_file_info_alloc()
+		fillFileInfo(out, info.Name(), info.Size(), info.ModTime().Unix(), info.IsDir())
+		*cinfo = out
+		return nil
+	})
+}
+
+//export pelicanc_file_close
+func pelicanc_file_close(cfile *C.pelican_file) *C.pelican_error {
+	if cfile == nil {
+		return nil
+	}
+	var err error
+	if cfile.handle != 0 {
+		h := cgo.Handle(cfile.handle)
+		st := h.Value().(*fileState)
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					err = fmt.Errorf("panic in pelican client: %v", r)
+				}
+			}()
+			err = st.file.Close()
+		}()
+		st.cancel()
+		h.Delete()
+	}
+	C.free(unsafe.Pointer(cfile))
+	return makeError(err)
 }
 
 // main is required for -buildmode=c-shared; it is never executed.
