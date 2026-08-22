@@ -31,10 +31,27 @@ extern "C" {
 #endif
 
 /* ------------------------------------------------------------------ *
- * Errors                                                             *
+ * Opaque types                                                       *
+ *                                                                    *
+ * Declared together so the asynchronous operation API can reference   *
+ * results defined in later sections.  No layout is ever exposed:      *
+ * every field is reached through the accessors below.                 *
  * ------------------------------------------------------------------ */
 
 typedef struct pelican_error pelican_error;
+typedef struct pelican_context pelican_context;
+typedef struct pelican_transfer_opts pelican_transfer_opts;
+typedef struct pelican_result pelican_result;
+typedef struct pelican_result_list pelican_result_list;
+typedef struct pelican_transfer pelican_transfer;
+typedef struct pelican_op pelican_op;
+typedef struct pelican_file_info pelican_file_info;
+typedef struct pelican_file_info_list pelican_file_info_list;
+typedef struct pelican_file pelican_file;
+
+/* ------------------------------------------------------------------ *
+ * Errors                                                             *
+ * ------------------------------------------------------------------ */
 
 /** Human-readable description; borrowed, never NULL. */
 const char *pelican_error_message(const pelican_error *err);
@@ -86,7 +103,6 @@ const char *pelican_version(void);
  * transfers and open files carry their own cancellation — see
  * pelican_transfer_cancel and pelican_file_close.)
  */
-typedef struct pelican_context pelican_context;
 
 pelican_context *pelican_context_new(void);
 void pelican_context_cancel(pelican_context *ctx);
@@ -129,7 +145,6 @@ typedef void (*pelican_progress_fn)(const char *object,
  * pelican_transfer_opts_free() (safe once the call it was passed to has
  * returned; string values are copied by the setters).
  */
-typedef struct pelican_transfer_opts pelican_transfer_opts;
 
 pelican_transfer_opts *pelican_transfer_opts_new(void);
 void pelican_transfer_opts_free(pelican_transfer_opts *opts);
@@ -188,7 +203,6 @@ void pelican_transfer_opts_set_destination_token_location(
  * Per-object transfer results                                        *
  * ------------------------------------------------------------------ */
 
-typedef struct pelican_result pelican_result;
 
 /** Remote object path this result describes; borrowed. */
 const char *pelican_result_source(const pelican_result *res);
@@ -216,7 +230,6 @@ const char *pelican_result_checksum_value(const pelican_result *res, size_t i);
 void pelican_result_free(pelican_result *res);
 
 /** An immutable list of results, as returned by the synchronous calls. */
-typedef struct pelican_result_list pelican_result_list;
 
 size_t pelican_result_list_count(const pelican_result_list *list);
 /** Borrowed element; valid until the list is freed.  NULL if out of range. */
@@ -297,7 +310,6 @@ pelican_error *pelican_prestage(pelican_context *ctx,
  * All calls on a given pelican_transfer must come from one thread (or
  * be externally serialized); distinct transfers are independent.
  */
-typedef struct pelican_transfer pelican_transfer;
 
 /** Begin an asynchronous download.  Fails only on malformed arguments
  *  or an uninitialized library; transfer-time errors are reported
@@ -365,10 +377,82 @@ void pelican_transfer_cancel(pelican_transfer *xfer);
 void pelican_transfer_free(pelican_transfer *xfer);
 
 /* ------------------------------------------------------------------ *
+ * Asynchronous single-shot operations                                *
+ * ------------------------------------------------------------------ */
+
+/**
+ * A single-shot asynchronous operation: the namespace calls, cache
+ * management, and file I/O below all have a `*_start` form that returns
+ * one of these instead of blocking.  Unlike pelican_transfer (which
+ * streams many results), an operation produces exactly one outcome.
+ *
+ * Usage:
+ *   1. Call a *_start function; it returns immediately.
+ *   2. Register pelican_op_notify_fd() for read events.  It becomes
+ *      readable when the operation completes and STAYS readable
+ *      thereafter.  Do not read or close it.
+ *   3. On wakeup (or any time), pelican_op_is_done() reports completion.
+ *   4. Check pelican_op_error(), collect the result with the matching
+ *      pelican_op_take_* function, then pelican_op_free().
+ *
+ * The take_* functions transfer ownership and may be called only once;
+ * a result that is never taken is released by pelican_op_free().  All
+ * calls on one operation must come from a single thread (or be
+ * externally serialized); distinct operations are independent.  No call
+ * in this section blocks.
+ */
+
+/** Readable once the operation has completed; library-owned. */
+int pelican_op_notify_fd(const pelican_op *op);
+
+/** Nonzero once the operation has completed. */
+int pelican_op_is_done(const pelican_op *op);
+
+/**
+ * Failure of a completed operation, or NULL on success (or if still
+ * running).  Borrowed — owned by the operation; do NOT pass to
+ * pelican_error_free().
+ */
+const pelican_error *pelican_op_error(const pelican_op *op);
+
+/** Request cancellation; the operation completes with an error. */
+void pelican_op_cancel(pelican_op *op);
+
+/**
+ * Release the operation and any result not taken.  Safe while the
+ * operation is still in flight: it is cancelled and detached, and its
+ * result discarded when it finishes.
+ */
+void pelican_op_free(pelican_op *op);
+
+/* Result collection.  Each returns 1 on success (ownership transferred
+ * to the caller) or 0 if the operation is unfinished, failed, produced a
+ * different result type, or was already taken. */
+
+int pelican_op_take_file_info(pelican_op *op, pelican_file_info **info);
+int pelican_op_take_file_info_list(pelican_op *op,
+                                   pelican_file_info_list **entries);
+int pelican_op_take_file(pelican_op *op, pelican_file **file);
+/** Byte count produced by an I/O operation (bytes read or written). */
+int pelican_op_take_count(pelican_op *op, long long *count);
+/** Data read by pelican_file_read_start/pelican_file_pread_start.  The
+ *  buffer is caller-owned; release it with pelican_buffer_free(). */
+int pelican_op_take_data(pelican_op *op, void **buf, size_t *len);
+/** Cache age (seconds; -1 if unknown) and size, from
+ *  pelican_cache_info_start.  Either out-pointer may be NULL. */
+int pelican_op_take_cache_info(pelican_op *op, long long *age_s,
+                               long long *size);
+/** Status message from pelican_evict_start; release with
+ *  pelican_string_free(). */
+int pelican_op_take_message(pelican_op *op, char **message);
+
+/** Free a buffer obtained from pelican_op_take_data(). */
+void pelican_buffer_free(void *buf);
+
+/* ------------------------------------------------------------------ *
  * Namespace operations (synchronous)                                 *
  * ------------------------------------------------------------------ */
 
-typedef struct pelican_file_info pelican_file_info;
 
 /** Object name; borrowed. */
 const char *pelican_file_info_name(const pelican_file_info *info);
@@ -380,7 +464,6 @@ long long pelican_file_info_mtime(const pelican_file_info *info);
 int pelican_file_info_is_collection(const pelican_file_info *info);
 void pelican_file_info_free(pelican_file_info *info);
 
-typedef struct pelican_file_info_list pelican_file_info_list;
 
 size_t pelican_file_info_list_count(const pelican_file_info_list *list);
 /** Borrowed element; valid until the list is freed.  NULL if out of range. */
@@ -430,6 +513,31 @@ pelican_error *pelican_evict(pelican_context *ctx,
 /** Free a string returned via an out-parameter (e.g. pelican_evict). */
 void pelican_string_free(char *s);
 
+/* Asynchronous forms of the above; collect results with the noted
+ * pelican_op_take_* function.  See "Asynchronous single-shot
+ * operations". */
+
+/** Completes with pelican_op_take_file_info(). */
+pelican_error *pelican_stat_start(const char *remote_url,
+                                  const pelican_transfer_opts *opts,
+                                  pelican_op **op);
+/** Completes with pelican_op_take_file_info_list(). */
+pelican_error *pelican_list_start(const char *remote_url,
+                                  const pelican_transfer_opts *opts,
+                                  pelican_op **op);
+/** Completes with no result; check pelican_op_error(). */
+pelican_error *pelican_delete_start(const char *remote_url,
+                                    const pelican_transfer_opts *opts,
+                                    pelican_op **op);
+/** Completes with pelican_op_take_cache_info(). */
+pelican_error *pelican_cache_info_start(const char *remote_url,
+                                        const pelican_transfer_opts *opts,
+                                        pelican_op **op);
+/** Completes with pelican_op_take_message(). */
+pelican_error *pelican_evict_start(const char *remote_url, int immediate,
+                                   const pelican_transfer_opts *opts,
+                                   pelican_op **op);
+
 /* ------------------------------------------------------------------ *
  * File I/O (PelicanFS)                                               *
  * ------------------------------------------------------------------ */
@@ -440,7 +548,6 @@ void pelican_string_free(char *s);
  * network I/O — from a single-threaded event loop, use them on worker
  * threads/processes or where blocking is acceptable.
  */
-typedef struct pelican_file pelican_file;
 
 /* Open flags (library-defined values; do not pass POSIX O_* here). */
 #define PELICAN_O_RDONLY 0
@@ -490,6 +597,50 @@ pelican_error *pelican_file_stat(pelican_file *file,
  * reports its outcome — always check the result.
  */
 pelican_error *pelican_file_close(pelican_file *file);
+
+/* ------------------------------------------------------------------ *
+ * Asynchronous file I/O                                              *
+ * ------------------------------------------------------------------ */
+
+/**
+ * Non-blocking counterparts to the calls above, for event-loop hosts.
+ * Each returns a pelican_op (see "Asynchronous single-shot
+ * operations") that completes when the I/O finishes.
+ *
+ * A pelican_file permits only ONE operation at a time: while an
+ * asynchronous operation is in flight, other calls on that handle —
+ * synchronous or asynchronous — fail with a "busy" error.  Reads and
+ * writes buffer internally, so no caller-supplied buffer has to stay
+ * alive; nothing the caller owns is touched after the call returns.
+ */
+
+/** Completes with pelican_op_take_file(). */
+pelican_error *pelican_fs_open_start(const char *remote_url, int flags,
+                                     const pelican_transfer_opts *opts,
+                                     pelican_op **op);
+
+/** Read up to `len` bytes from the current position.  Completes with
+ *  pelican_op_take_data(); zero length signals end-of-file. */
+pelican_error *pelican_file_read_start(pelican_file *file, size_t len,
+                                       pelican_op **op);
+
+/** Positional read; does not move the file position.  Completes with
+ *  pelican_op_take_data(). */
+pelican_error *pelican_file_pread_start(pelican_file *file, size_t len,
+                                        long long offset, pelican_op **op);
+
+/** Append `len` bytes (copied before returning).  Completes with
+ *  pelican_op_take_count(). */
+pelican_error *pelican_file_write_start(pelican_file *file, const void *buf,
+                                        size_t len, pelican_op **op);
+
+/**
+ * Close the file asynchronously, finalizing an upload.  Takes ownership
+ * of `file`: the handle must not be used again once this returns, even
+ * before the operation completes.  The operation produces no result;
+ * check pelican_op_error() for the close outcome.
+ */
+pelican_error *pelican_file_close_start(pelican_file *file, pelican_op **op);
 
 #ifdef __cplusplus
 } /* extern "C" */

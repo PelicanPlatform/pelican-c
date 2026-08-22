@@ -22,6 +22,15 @@ make                   # builds build/libpelicanclient.{so,dylib}
 make example           # builds the example clients
 make test              # offline smoke test
 make integration-test  # in-process federation test (no XRootD needed)
+make install           # PREFIX=/usr/local by default; DESTDIR supported
+```
+
+`make install` lays down the versioned shared library and its
+development symlink, `include/pelican/client.h`, and a pkg-config file,
+so consumers build with:
+
+```sh
+cc myapp.c $(pkg-config --cflags --libs libpelicanclient)
 ```
 
 CI runs the build/smoke matrix and the federation integration test —
@@ -84,6 +93,31 @@ if (pelican_transfer_is_done(xfer)) {
 }
 ```
 
+## Asynchronous namespace operations and file I/O
+
+Everything else has a non-blocking form too, built on a single-shot
+`pelican_op` handle with the same notification-fd pattern: `stat`,
+`list`, `delete`, `cache_info`, `evict`, and the file calls (`open`,
+`read`, `pread`, `write`, `close`).  A daemon can therefore reach the
+federation without ever blocking its event loop.
+
+```c
+pelican_op *op;
+err = pelican_stat_start(url, NULL, &op);
+register_fd(pelican_op_notify_fd(op));   /* readable once complete */
+
+/* handler: */
+if (pelican_op_is_done(op)) {
+    pelican_file_info *info;
+    if (pelican_op_take_file_info(op, &info)) { /* ... */ }
+    pelican_op_free(op);
+}
+```
+
+Asynchronous reads and writes buffer internally, so no caller-supplied
+buffer has to outlive the call, and a file handle admits one operation at
+a time — a second call fails cleanly instead of corrupting the stream.
+
 ## File I/O (PelicanFS)
 
 Remote objects can be read and written directly — sequential reads,
@@ -116,6 +150,8 @@ notification-fd protocol, and API conventions.
 | Namespace | `pelican_stat`, `pelican_list`, `pelican_delete` (+ `pelican_file_info_*` accessors) |
 | Cache management | `pelican_cache_info`, `pelican_evict` |
 | File I/O | `pelican_fs_open`, `pelican_file_read/_pread/_write/_seek/_stat/_close` |
+| Async operations | `pelican_stat_start`, `pelican_list_start`, `pelican_delete_start`, `pelican_cache_info_start`, `pelican_evict_start`, `pelican_fs_open_start`, `pelican_file_read_start/_pread_start/_write_start/_close_start` |
+| Operation handles | `pelican_op_notify_fd`, `..._is_done`, `..._error`, `..._cancel`, `..._free`, `..._take_file_info/_file_info_list/_file/_count/_data/_cache_info/_message` |
 | Errors | `pelican_error_message`, `..._is_retryable`, `..._code`, `..._free` |
 
 Every fallible call returns a `pelican_error *` (NULL on success) carrying

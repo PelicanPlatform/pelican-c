@@ -1,0 +1,10 @@
+prefix=@PREFIX@
+libdir=@LIBDIR@
+includedir=@INCLUDEDIR@
+
+Name: libpelicanclient
+Description: C interface to the Pelican Platform client
+URL: https://github.com/PelicanPlatform/pelican-c
+Version: @VERSION@
+Libs: -L${libdir} -lpelicanclient
+Cflags: -I${includedir}

@@ -12,9 +12,15 @@
  *   integration_client copy      <source-url> <dest-url>
  *   integration_client fs-read   <url>
  *   integration_client delete    <url>
+ *   integration_client stat-async    <url>
+ *   integration_client list-async    <url>
+ *   integration_client fs-read-async <url>
  *
  * Trailing [opt...] arguments for get: "checksum=<digest>",
  * "cache=<url>", "require-checksum".
+ *
+ * The *-async subcommands drive the single-shot operation API through a
+ * poll() loop, the way a DaemonCore Register_Pipe handler would.
  *
  * Output is line-oriented `key=value` pairs on stdout for the test
  * harness to assert on.  get-async additionally verifies the async-mode
@@ -265,6 +271,198 @@ cmd_fs_read(const char *url)
     return 0;
 }
 
+/* Block in poll() until the operation's notification fd fires, exactly
+ * as an event loop would before dispatching its read handler. */
+static int
+await_op(pelican_op *op)
+{
+    struct pollfd pfd;
+    pfd.fd = pelican_op_notify_fd(op);
+    pfd.events = POLLIN;
+    while (!pelican_op_is_done(op)) {
+        if (poll(&pfd, 1, -1) < 0) {
+            perror("poll");
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int
+cmd_stat_async(const char *url)
+{
+    pelican_op *op = NULL;
+    pelican_error *err = pelican_stat_start(url, NULL, &op);
+    if (err != NULL)
+        return fail("stat_start", err);
+    if (await_op(op) != 0) {
+        pelican_op_free(op);
+        return 1;
+    }
+    const pelican_error *oerr = pelican_op_error(op);
+    if (oerr != NULL) {
+        fprintf(stderr, "stat-async failed: %s\n",
+                pelican_error_message(oerr));
+        pelican_op_free(op);
+        return 1;
+    }
+    pelican_file_info *info = NULL;
+    if (!pelican_op_take_file_info(op, &info)) {
+        fprintf(stderr, "stat-async produced no file info\n");
+        pelican_op_free(op);
+        return 1;
+    }
+    pelican_op_free(op);
+    printf("name=%s\nsize=%lld\nis_collection=%d\n",
+           pelican_file_info_name(info), pelican_file_info_size(info),
+           pelican_file_info_is_collection(info));
+    pelican_file_info_free(info);
+    return 0;
+}
+
+static int
+cmd_list_async(const char *url)
+{
+    pelican_op *op = NULL;
+    pelican_error *err = pelican_list_start(url, NULL, &op);
+    if (err != NULL)
+        return fail("list_start", err);
+    if (await_op(op) != 0) {
+        pelican_op_free(op);
+        return 1;
+    }
+    const pelican_error *oerr = pelican_op_error(op);
+    if (oerr != NULL) {
+        fprintf(stderr, "list-async failed: %s\n",
+                pelican_error_message(oerr));
+        pelican_op_free(op);
+        return 1;
+    }
+    pelican_file_info_list *entries = NULL;
+    if (!pelican_op_take_file_info_list(op, &entries)) {
+        fprintf(stderr, "list-async produced no listing\n");
+        pelican_op_free(op);
+        return 1;
+    }
+    pelican_op_free(op);
+    printf("count=%zu\n", pelican_file_info_list_count(entries));
+    for (size_t i = 0; i < pelican_file_info_list_count(entries); i++) {
+        const pelican_file_info *e = pelican_file_info_list_get(entries, i);
+        printf("entry=%s size=%lld collection=%d\n",
+               pelican_file_info_name(e), pelican_file_info_size(e),
+               pelican_file_info_is_collection(e));
+    }
+    pelican_file_info_list_free(entries);
+    return 0;
+}
+
+/* Open, read to EOF, and close a remote object using only the
+ * non-blocking calls.  Also checks that the handle refuses a second
+ * concurrent operation. */
+static int
+cmd_fs_read_async(const char *url)
+{
+    pelican_error *err;
+    pelican_op *op = NULL;
+
+    if ((err = pelican_fs_open_start(url, PELICAN_O_RDONLY, NULL, &op)) != NULL)
+        return fail("fs_open_start", err);
+    if (await_op(op) != 0) {
+        pelican_op_free(op);
+        return 1;
+    }
+    const pelican_error *oerr = pelican_op_error(op);
+    if (oerr != NULL) {
+        fprintf(stderr, "fs_open_start failed: %s\n",
+                pelican_error_message(oerr));
+        pelican_op_free(op);
+        return 1;
+    }
+    pelican_file *file = NULL;
+    if (!pelican_op_take_file(op, &file)) {
+        fprintf(stderr, "fs_open_start produced no file\n");
+        pelican_op_free(op);
+        return 1;
+    }
+    pelican_op_free(op);
+
+    long long total = 0;
+    int busy_rejected = 0;
+    for (;;) {
+        pelican_op *read_op = NULL;
+        if ((err = pelican_file_read_start(file, 65536, &read_op)) != NULL) {
+            pelican_error_free(pelican_file_close(file));
+            return fail("file_read_start", err);
+        }
+
+        /* A second operation on a busy handle must be refused rather
+         * than corrupting the stream. */
+        if (total == 0) {
+            pelican_op *conflict = NULL;
+            pelican_error *berr =
+                pelican_file_read_start(file, 16, &conflict);
+            if (berr != NULL) {
+                busy_rejected = 1;
+                pelican_error_free(berr);
+            } else {
+                fprintf(stderr, "THREADING VIOLATION: concurrent read on "
+                                "a busy handle was accepted\n");
+                pelican_op_free(conflict);
+            }
+        }
+
+        if (await_op(read_op) != 0) {
+            pelican_op_free(read_op);
+            pelican_error_free(pelican_file_close(file));
+            return 1;
+        }
+        oerr = pelican_op_error(read_op);
+        if (oerr != NULL) {
+            fprintf(stderr, "file_read_start failed: %s\n",
+                    pelican_error_message(oerr));
+            pelican_op_free(read_op);
+            pelican_error_free(pelican_file_close(file));
+            return 1;
+        }
+        void *buf = NULL;
+        size_t len = 0;
+        if (!pelican_op_take_data(read_op, &buf, &len)) {
+            fprintf(stderr, "read produced no data result\n");
+            pelican_op_free(read_op);
+            pelican_error_free(pelican_file_close(file));
+            return 1;
+        }
+        pelican_op_free(read_op);
+        if (len == 0) { /* end of file */
+            pelican_buffer_free(buf);
+            break;
+        }
+        fwrite(buf, 1, len, stdout);
+        total += (long long)len;
+        pelican_buffer_free(buf);
+    }
+    fprintf(stderr, "fs_read_bytes=%lld\n", total);
+
+    /* Asynchronous close takes ownership of the handle. */
+    if ((err = pelican_file_close_start(file, &op)) != NULL)
+        return fail("file_close_start", err);
+    if (await_op(op) != 0) {
+        pelican_op_free(op);
+        return 1;
+    }
+    oerr = pelican_op_error(op);
+    if (oerr != NULL) {
+        fprintf(stderr, "file_close_start failed: %s\n",
+                pelican_error_message(oerr));
+        pelican_op_free(op);
+        return 1;
+    }
+    pelican_op_free(op);
+
+    printf("busy_rejected=%d\n", busy_rejected);
+    return busy_rejected ? 0 : 1;
+}
+
 static int
 cmd_delete(const char *url)
 {
@@ -304,6 +502,12 @@ main(int argc, char **argv)
         return cmd_fs_read(argv[2]);
     if (strcmp(cmd, "delete") == 0)
         return cmd_delete(argv[2]);
+    if (strcmp(cmd, "stat-async") == 0)
+        return cmd_stat_async(argv[2]);
+    if (strcmp(cmd, "list-async") == 0)
+        return cmd_list_async(argv[2]);
+    if (strcmp(cmd, "fs-read-async") == 0)
+        return cmd_fs_read_async(argv[2]);
 
     fprintf(stderr, "unknown subcommand: %s\n", cmd);
     return 2;

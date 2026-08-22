@@ -270,6 +270,32 @@ func TestCClientFederation(t *testing.T) {
 		assert.Equal(t, helloContent, stdout)
 	})
 
+	// The single-shot asynchronous API, driven through poll() the way an
+	// event-loop host would.
+	t.Run("async-stat", func(t *testing.T) {
+		stdout, _, code := runDriver(t, driver, env, "stat-async", objectUrl("hello_world.txt"))
+		require.Equal(t, 0, code)
+		assert.Contains(t, stdout, fmt.Sprintf("size=%d\n", len(helloContent)))
+		assert.Contains(t, stdout, "is_collection=0")
+	})
+
+	t.Run("async-list", func(t *testing.T) {
+		stdout, _, code := runDriver(t, driver, env, "list-async", objectUrl("/"))
+		require.Equal(t, 0, code)
+		assert.Contains(t, stdout, "hello_world.txt")
+	})
+
+	// Opens, reads to EOF, and closes using only non-blocking calls; the
+	// driver also asserts that a second operation on a busy handle is
+	// refused rather than corrupting the stream.
+	t.Run("async-fs-read", func(t *testing.T) {
+		stdout, stderr, code := runDriver(t, driver, env, "fs-read-async", objectUrl("hello_world.txt"))
+		require.Equal(t, 0, code)
+		assert.Contains(t, stdout, helloContent)
+		assert.Contains(t, stdout, "busy_rejected=1")
+		assert.Contains(t, stderr, fmt.Sprintf("fs_read_bytes=%d", len(helloContent)))
+	})
+
 	t.Run("list", func(t *testing.T) {
 		stdout, _, code := runDriver(t, driver, env, "list", objectUrl("/"))
 		require.Equal(t, 0, code)

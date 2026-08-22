@@ -428,14 +428,60 @@ func pelicanc_put(cctx *C.pelican_context, localPath, remoteUrl *C.char, copts *
 // loop.  The pipe is drained only when the queue is observed empty, so
 // readability is level-triggered: readable ⇒ call next_result until it
 // reports nothing pending.
+// notifyPipe is the wakeup mechanism shared by asynchronous transfers
+// and operations: a non-blocking, close-on-exec pipe whose read end the
+// host registers with its event loop.
+//
+// Discipline for every user: wake() is called only while holding the
+// owning state's mutex and only after checking that the state has not
+// been freed, so a byte can never be written to a closed (and possibly
+// recycled) descriptor.
+type notifyPipe struct {
+	readFd  int
+	writeFd int
+}
+
+func newNotifyPipe() (notifyPipe, error) {
+	var fds [2]int
+	if err := syscall.Pipe(fds[:]); err != nil {
+		return notifyPipe{}, fmt.Errorf("failed to create notification pipe: %w", err)
+	}
+	for _, fd := range fds {
+		_ = syscall.SetNonblock(fd, true)
+		syscall.CloseOnExec(fd)
+	}
+	return notifyPipe{readFd: fds[0], writeFd: fds[1]}, nil
+}
+
+func (p notifyPipe) wake() {
+	_, _ = syscall.Write(p.writeFd, []byte{1})
+}
+
+// drain empties the pipe, quiescing the host's event loop.  Callers hold
+// the owning mutex and have observed that there is nothing left to
+// report; a concurrent producer re-arms the pipe afterward.
+func (p notifyPipe) drain() {
+	buf := make([]byte, 256)
+	for {
+		n, err := syscall.Read(p.readFd, buf)
+		if n <= 0 || err != nil {
+			return
+		}
+	}
+}
+
+func (p notifyPipe) close() {
+	_ = syscall.Close(p.readFd)
+	_ = syscall.Close(p.writeFd)
+}
+
 type transferState struct {
+	notifyPipe
 	mu      sync.Mutex
 	queue   []*C.pelican_result
 	done    bool
 	freed   bool
 	termErr *C.pelican_error
-	readFd  int
-	writeFd int
 	cancel  context.CancelFunc
 	tc      *client.TransferClient
 
@@ -454,25 +500,6 @@ type progressEvent struct {
 	downloaded int64
 	total      int64
 	completed  bool
-}
-
-// wake writes one byte to the notification pipe.  Callers hold mu.  A
-// full pipe returns EAGAIN, which is fine — the fd is already readable.
-func (ts *transferState) wake() {
-	_, _ = syscall.Write(ts.writeFd, []byte{1})
-}
-
-// drainPipe empties the notification pipe.  Callers hold mu and have
-// observed an empty queue; any concurrent enqueue re-arms the pipe
-// after we release the lock.
-func (ts *transferState) drainPipe() {
-	buf := make([]byte, 256)
-	for {
-		n, err := syscall.Read(ts.readFd, buf)
-		if n <= 0 || err != nil {
-			return
-		}
-	}
 }
 
 // enqueueProgress records a progress report (from a Go thread) for later
@@ -692,16 +719,12 @@ func startTransfer(kind xferKind, a, b string, copts *C.pelican_transfer_opts, o
 		if err != nil {
 			return makeError(fmt.Errorf("failed to start transfer engine: %w", err))
 		}
-		var fds [2]int
-		if err := syscall.Pipe(fds[:]); err != nil {
-			return makeError(fmt.Errorf("failed to create notification pipe: %w", err))
-		}
-		for _, fd := range fds {
-			_ = syscall.SetNonblock(fd, true)
-			syscall.CloseOnExec(fd)
+		pipe, err := newNotifyPipe()
+		if err != nil {
+			return makeError(err)
 		}
 		ctx, cancel := context.WithCancel(context.Background())
-		ts := &transferState{readFd: fds[0], writeFd: fds[1], cancel: cancel}
+		ts := &transferState{notifyPipe: pipe, cancel: cancel}
 		var sink progressSink
 		if copts != nil && copts.progress != nil {
 			ts.progressFn = copts.progress
@@ -711,13 +734,12 @@ func startTransfer(kind xferKind, a, b string, copts *C.pelican_transfer_opts, o
 		opts, recursive, optErr := buildOptions(copts, sink)
 		if optErr != nil {
 			cancel()
-			_ = syscall.Close(fds[0])
-			_ = syscall.Close(fds[1])
+			pipe.close()
 			return makeError(optErr)
 		}
 		cxfer := C.pelicanc_transfer_alloc()
 		cxfer.handle = C.uintptr_t(cgo.NewHandle(ts))
-		cxfer.notify_fd = C.int(fds[0])
+		cxfer.notify_fd = C.int(pipe.readFd)
 		go runTransfer(ctx, ts, te, kind, a, b, recursive, opts)
 		*out = cxfer
 		return nil
@@ -823,7 +845,7 @@ func pelicanc_transfer_next_result(cxfer *C.pelican_transfer, res **C.pelican_re
 	// Nothing pending: quiesce the notification fd.  A result or the
 	// completion event arriving after this drain re-arms it, because
 	// producers write their wake byte under the same lock.
-	ts.drainPipe()
+	ts.drain()
 	return 0
 }
 
@@ -878,12 +900,308 @@ func pelicanc_transfer_free(cxfer *C.pelican_transfer) {
 		ts.queue = nil
 		C.pelican_error_free(ts.termErr)
 		ts.termErr = nil
-		_ = syscall.Close(ts.readFd)
-		_ = syscall.Close(ts.writeFd)
+		ts.close()
 		ts.mu.Unlock()
 		h.Delete()
 	}
 	C.free(unsafe.Pointer(cxfer))
+}
+
+/* ------------------------------------------------------------------ *
+ * Asynchronous single-shot operations                                *
+ * ------------------------------------------------------------------ */
+
+// opKind tags which result an operation produced, so the take_*
+// functions can refuse a mismatched request and opFree can release an
+// uncollected payload.
+type opKind int
+
+const (
+	opNone opKind = iota
+	opFileInfo
+	opFileInfoList
+	opFile
+	opCount
+	opData
+	opCacheInfo
+	opMessage
+)
+
+// opResult is what an operation's goroutine produces.  Pointer payloads
+// are C-allocated and owned by the operation until taken.
+type opResult struct {
+	kind  opKind
+	ptr   unsafe.Pointer
+	count int64
+	age   int64
+	size  int64
+}
+
+// opState is the Go side of a pelican_op.  Unlike a transfer, an
+// operation completes exactly once, so the notification fd is written
+// once and left readable: the host's event loop sees a level-triggered
+// "ready" that persists until the operation is freed.
+type opState struct {
+	notifyPipe
+	mu     sync.Mutex
+	done   bool
+	freed  bool
+	err    *C.pelican_error
+	result opResult
+	cancel context.CancelFunc
+	// onDone runs when the operation completes or is abandoned; used to
+	// clear the owning file's busy flag.
+	onDone func()
+}
+
+// freeResult releases an uncollected payload.
+func freeResult(r opResult) {
+	switch r.kind {
+	case opFileInfo:
+		C.pelican_file_info_free((*C.pelican_file_info)(r.ptr))
+	case opFileInfoList:
+		C.pelican_file_info_list_free((*C.pelican_file_info_list)(r.ptr))
+	case opFile:
+		// An unclaimed open() result still owns a live PelicanFS and its
+		// transfer engine, so it must be closed rather than freed.
+		_ = closeFileHandle((*C.pelican_file)(r.ptr))
+	case opData, opMessage:
+		C.free(r.ptr)
+	}
+}
+
+func (os_ *opState) finish(r opResult, err error) {
+	// Release the owning resource (e.g. the file's busy flag) BEFORE
+	// publishing completion: a host woken by the notification fd may
+	// immediately start the next operation on that file, and must not
+	// be told it is busy by the operation that just finished.
+	if os_.onDone != nil {
+		os_.onDone()
+	}
+	os_.mu.Lock()
+	defer os_.mu.Unlock()
+	if os_.freed {
+		freeResult(r)
+		return
+	}
+	os_.done = true
+	os_.result = r
+	os_.err = makeError(err)
+	os_.wake()
+}
+
+func opStateFor(cop *C.pelican_op) *opState {
+	return cgo.Handle(cop.handle).Value().(*opState)
+}
+
+// startOp submits fn to run on a library goroutine and hands back a
+// pelican_op.  fn must not touch caller-owned C memory: everything it
+// needs (options, data to write) is captured on the calling thread
+// before this returns.
+func startOp(fn func(ctx context.Context) (opResult, error), onDone func(), out **C.pelican_op) *C.pelican_error {
+	return guard(func() *C.pelican_error {
+		if err := requireInit(); err != nil {
+			if onDone != nil {
+				onDone()
+			}
+			return makeError(err)
+		}
+		if out == nil {
+			if onDone != nil {
+				onDone()
+			}
+			return makeError(fmt.Errorf("output operation pointer may not be NULL"))
+		}
+		*out = nil
+		pipe, err := newNotifyPipe()
+		if err != nil {
+			if onDone != nil {
+				onDone()
+			}
+			return makeError(err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		st := &opState{notifyPipe: pipe, cancel: cancel, onDone: onDone}
+		cop := C.pelicanc_op_alloc()
+		cop.handle = C.uintptr_t(cgo.NewHandle(st))
+		cop.notify_fd = C.int(pipe.readFd)
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					st.finish(opResult{}, fmt.Errorf("panic in pelican client: %v", r))
+				}
+			}()
+			result, err := fn(ctx)
+			st.finish(result, err)
+		}()
+		*out = cop
+		return nil
+	})
+}
+
+//export pelicanc_op_is_done
+func pelicanc_op_is_done(cop *C.pelican_op) C.int {
+	st := opStateFor(cop)
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.done {
+		return 1
+	}
+	return 0
+}
+
+//export pelicanc_op_error
+func pelicanc_op_error(cop *C.pelican_op) *C.pelican_error {
+	st := opStateFor(cop)
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.err
+}
+
+//export pelicanc_op_cancel
+func pelicanc_op_cancel(cop *C.pelican_op) {
+	if cop == nil || cop.handle == 0 {
+		return
+	}
+	opStateFor(cop).cancel()
+}
+
+//export pelicanc_op_free
+func pelicanc_op_free(cop *C.pelican_op) {
+	if cop == nil {
+		return
+	}
+	if cop.handle != 0 {
+		h := cgo.Handle(cop.handle)
+		st := h.Value().(*opState)
+		st.mu.Lock()
+		st.freed = true
+		freeResult(st.result)
+		st.result = opResult{}
+		C.pelican_error_free(st.err)
+		st.err = nil
+		st.close()
+		st.mu.Unlock()
+		// Cancel outside the lock: cancellation can race the operation's
+		// own completion, which needs the same mutex.
+		st.cancel()
+		h.Delete()
+	}
+	C.free(unsafe.Pointer(cop))
+}
+
+// takeResult hands the payload of a completed operation to the caller if
+// it matches the requested kind.
+func takeResult(cop *C.pelican_op, want opKind) (opResult, bool) {
+	st := opStateFor(cop)
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if !st.done || st.err != nil || st.result.kind != want {
+		return opResult{}, false
+	}
+	r := st.result
+	st.result = opResult{}
+	return r, true
+}
+
+//export pelicanc_op_take_file_info
+func pelicanc_op_take_file_info(cop *C.pelican_op, out **C.pelican_file_info) C.int {
+	r, ok := takeResult(cop, opFileInfo)
+	if !ok {
+		return 0
+	}
+	if out != nil {
+		*out = (*C.pelican_file_info)(r.ptr)
+	} else {
+		freeResult(r)
+	}
+	return 1
+}
+
+//export pelicanc_op_take_file_info_list
+func pelicanc_op_take_file_info_list(cop *C.pelican_op, out **C.pelican_file_info_list) C.int {
+	r, ok := takeResult(cop, opFileInfoList)
+	if !ok {
+		return 0
+	}
+	if out != nil {
+		*out = (*C.pelican_file_info_list)(r.ptr)
+	} else {
+		freeResult(r)
+	}
+	return 1
+}
+
+//export pelicanc_op_take_file
+func pelicanc_op_take_file(cop *C.pelican_op, out **C.pelican_file) C.int {
+	r, ok := takeResult(cop, opFile)
+	if !ok {
+		return 0
+	}
+	if out != nil {
+		*out = (*C.pelican_file)(r.ptr)
+	} else {
+		freeResult(r)
+	}
+	return 1
+}
+
+//export pelicanc_op_take_count
+func pelicanc_op_take_count(cop *C.pelican_op, out *C.longlong) C.int {
+	r, ok := takeResult(cop, opCount)
+	if !ok {
+		return 0
+	}
+	if out != nil {
+		*out = C.longlong(r.count)
+	}
+	return 1
+}
+
+//export pelicanc_op_take_data
+func pelicanc_op_take_data(cop *C.pelican_op, buf *unsafe.Pointer, length *C.size_t) C.int {
+	r, ok := takeResult(cop, opData)
+	if !ok {
+		return 0
+	}
+	if buf == nil {
+		freeResult(r)
+		return 1
+	}
+	*buf = r.ptr
+	if length != nil {
+		*length = C.size_t(r.count)
+	}
+	return 1
+}
+
+//export pelicanc_op_take_cache_info
+func pelicanc_op_take_cache_info(cop *C.pelican_op, ageOut, sizeOut *C.longlong) C.int {
+	r, ok := takeResult(cop, opCacheInfo)
+	if !ok {
+		return 0
+	}
+	if ageOut != nil {
+		*ageOut = C.longlong(r.age)
+	}
+	if sizeOut != nil {
+		*sizeOut = C.longlong(r.size)
+	}
+	return 1
+}
+
+//export pelicanc_op_take_message
+func pelicanc_op_take_message(cop *C.pelican_op, out **C.char) C.int {
+	r, ok := takeResult(cop, opMessage)
+	if !ok {
+		return 0
+	}
+	if out != nil {
+		*out = (*C.char)(r.ptr)
+	} else {
+		freeResult(r)
+	}
+	return 1
 }
 
 /* ------------------------------------------------------------------ *
@@ -917,11 +1235,29 @@ func pelicanc_stat(cctx *C.pelican_context, remoteUrl *C.char, copts *C.pelican_
 		if err != nil {
 			return makeError(err)
 		}
-		out := C.pelicanc_file_info_alloc()
-		fillFileInfo(out, info.Name, info.Size, info.ModTime.Unix(), info.IsCollection)
-		*cinfo = out
+		*cinfo = makeFileInfo(info)
 		return nil
 	})
+}
+
+// makeFileInfo converts one client.FileInfo into a C file info.
+func makeFileInfo(info *client.FileInfo) *C.pelican_file_info {
+	out := C.pelicanc_file_info_alloc()
+	fillFileInfo(out, info.Name, info.Size, info.ModTime.Unix(), info.IsCollection)
+	return out
+}
+
+// makeFileInfoList converts a listing into a C file info list.
+func makeFileInfoList(infos []client.FileInfo) *C.pelican_file_info_list {
+	list := C.pelicanc_file_info_list_alloc(C.size_t(len(infos)))
+	if len(infos) > 0 {
+		items := unsafe.Slice(list.items, len(infos))
+		for i := range infos {
+			items[i] = makeFileInfo(&infos[i])
+		}
+		list.count = C.size_t(len(infos))
+	}
+	return list
 }
 
 //export pelicanc_list
@@ -942,16 +1278,7 @@ func pelicanc_list(cctx *C.pelican_context, remoteUrl *C.char, copts *C.pelican_
 		if err != nil {
 			return makeError(err)
 		}
-		list := C.pelicanc_file_info_list_alloc(C.size_t(len(infos)))
-		if len(infos) > 0 {
-			items := unsafe.Slice(list.items, len(infos))
-			for i := range infos {
-				items[i] = C.pelicanc_file_info_alloc()
-				fillFileInfo(items[i], infos[i].Name, infos[i].Size, infos[i].ModTime.Unix(), infos[i].IsCollection)
-			}
-			list.count = C.size_t(len(infos))
-		}
-		*listOut = list
+		*listOut = makeFileInfoList(infos)
 		return nil
 	})
 }
@@ -970,6 +1297,87 @@ func pelicanc_delete(cctx *C.pelican_context, remoteUrl *C.char, copts *C.pelica
 	})
 }
 
+/* Asynchronous namespace and cache operations.  Options are translated
+ * on the calling thread so the caller may free them as soon as the
+ * *_start call returns. */
+
+//export pelicanc_stat_start
+func pelicanc_stat_start(remoteUrl *C.char, copts *C.pelican_transfer_opts, out **C.pelican_op) *C.pelican_error {
+	opts, _, optErr := buildOptions(copts, nil)
+	if optErr != nil {
+		return makeError(optErr)
+	}
+	remote := C.GoString(remoteUrl)
+	return startOp(func(ctx context.Context) (opResult, error) {
+		info, err := client.DoStat(ctx, remote, opts...)
+		if err != nil {
+			return opResult{}, err
+		}
+		return opResult{kind: opFileInfo, ptr: unsafe.Pointer(makeFileInfo(info))}, nil
+	}, nil, out)
+}
+
+//export pelicanc_list_start
+func pelicanc_list_start(remoteUrl *C.char, copts *C.pelican_transfer_opts, out **C.pelican_op) *C.pelican_error {
+	opts, _, optErr := buildOptions(copts, nil)
+	if optErr != nil {
+		return makeError(optErr)
+	}
+	remote := C.GoString(remoteUrl)
+	return startOp(func(ctx context.Context) (opResult, error) {
+		infos, err := client.DoList(ctx, remote, opts...)
+		if err != nil {
+			return opResult{}, err
+		}
+		return opResult{kind: opFileInfoList, ptr: unsafe.Pointer(makeFileInfoList(infos))}, nil
+	}, nil, out)
+}
+
+//export pelicanc_delete_start
+func pelicanc_delete_start(remoteUrl *C.char, copts *C.pelican_transfer_opts, out **C.pelican_op) *C.pelican_error {
+	opts, recursive, optErr := buildOptions(copts, nil)
+	if optErr != nil {
+		return makeError(optErr)
+	}
+	remote := C.GoString(remoteUrl)
+	return startOp(func(ctx context.Context) (opResult, error) {
+		return opResult{}, client.DoDelete(ctx, remote, recursive, opts...)
+	}, nil, out)
+}
+
+//export pelicanc_cache_info_start
+func pelicanc_cache_info_start(remoteUrl *C.char, copts *C.pelican_transfer_opts, out **C.pelican_op) *C.pelican_error {
+	opts, _, optErr := buildOptions(copts, nil)
+	if optErr != nil {
+		return makeError(optErr)
+	}
+	remote := C.GoString(remoteUrl)
+	return startOp(func(ctx context.Context) (opResult, error) {
+		age, size, err := client.DoCacheInfo(ctx, remote, opts...)
+		if err != nil {
+			return opResult{}, err
+		}
+		return opResult{kind: opCacheInfo, age: int64(age), size: size}, nil
+	}, nil, out)
+}
+
+//export pelicanc_evict_start
+func pelicanc_evict_start(remoteUrl *C.char, immediate C.int, copts *C.pelican_transfer_opts, out **C.pelican_op) *C.pelican_error {
+	opts, _, optErr := buildOptions(copts, nil)
+	if optErr != nil {
+		return makeError(optErr)
+	}
+	remote := C.GoString(remoteUrl)
+	now := immediate != 0
+	return startOp(func(ctx context.Context) (opResult, error) {
+		message, err := client.DoEvict(ctx, remote, now, opts...)
+		if err != nil {
+			return opResult{}, err
+		}
+		return opResult{kind: opMessage, ptr: unsafe.Pointer(C.CString(message))}, nil
+	}, nil, out)
+}
+
 /* ------------------------------------------------------------------ *
  * File I/O (PelicanFS)                                               *
  * ------------------------------------------------------------------ */
@@ -978,13 +1386,85 @@ func pelicanc_delete(cctx *C.pelican_context, remoteUrl *C.char, copts *C.pelica
 // PelicanFS instance (and thus a TransferEngine); PelicanFS exposes no
 // shutdown, so the context is cancelled on close to reap the engine's
 // goroutines.
+// A PelicanFile is not safe for concurrent use (reads mutate the file
+// position and share a pipe), so each handle admits one operation at a
+// time; busy tracks that, letting a second call fail cleanly instead of
+// corrupting the stream.
 type fileState struct {
 	file   fs.File
 	cancel context.CancelFunc
+	mu     sync.Mutex
+	busy   bool
+}
+
+// acquire claims the handle for one operation.
+func (fst *fileState) acquire() error {
+	fst.mu.Lock()
+	defer fst.mu.Unlock()
+	if fst.busy {
+		return fmt.Errorf("file handle is busy: another operation is already in flight")
+	}
+	fst.busy = true
+	return nil
+}
+
+func (fst *fileState) release() {
+	fst.mu.Lock()
+	fst.busy = false
+	fst.mu.Unlock()
 }
 
 func fileStateFor(cfile *C.pelican_file) *fileState {
 	return cgo.Handle(cfile.handle).Value().(*fileState)
+}
+
+// openFile performs the blocking open, shared by the synchronous and
+// asynchronous entry points.
+func openFile(remote string, goFlags int, opts []client.TransferOption) (*C.pelican_file, error) {
+	u, err := url.Parse(remote)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse remote URL: %w", err)
+	}
+	if u.Scheme == "" || u.Host == "" {
+		return nil, fmt.Errorf("remote URL %q must include a scheme and federation host (e.g. pelican://federation/path)", u.String())
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	pfs := client.NewPelicanFSWithPrefix(ctx, u.Scheme+"://"+u.Host, opts...)
+	f, err := pfs.OpenFile(u.Path, goFlags)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	cfile := C.pelicanc_file_alloc()
+	cfile.handle = C.uintptr_t(cgo.NewHandle(&fileState{file: f, cancel: cancel}))
+	return cfile, nil
+}
+
+// closeFileHandle closes the underlying file, reaps the PelicanFS
+// context, and releases the handle.  Shared by the synchronous close,
+// the asynchronous close, and the disposal of an open() result that the
+// caller never collected.
+func closeFileHandle(cfile *C.pelican_file) error {
+	if cfile == nil {
+		return nil
+	}
+	var err error
+	if cfile.handle != 0 {
+		h := cgo.Handle(cfile.handle)
+		fst := h.Value().(*fileState)
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					err = fmt.Errorf("panic in pelican client: %v", r)
+				}
+			}()
+			err = fst.file.Close()
+		}()
+		fst.cancel()
+		h.Delete()
+	}
+	C.free(unsafe.Pointer(cfile))
+	return err
 }
 
 func translateOpenFlags(flags C.int) (int, error) {
@@ -1024,26 +1504,14 @@ func pelicanc_fs_open(remoteUrl *C.char, flags C.int, copts *C.pelican_transfer_
 		if err != nil {
 			return makeError(err)
 		}
-		u, err := url.Parse(C.GoString(remoteUrl))
-		if err != nil {
-			return makeError(fmt.Errorf("failed to parse remote URL: %w", err))
-		}
-		if u.Scheme == "" || u.Host == "" {
-			return makeError(fmt.Errorf("remote URL %q must include a scheme and federation host (e.g. pelican://federation/path)", u.String()))
-		}
 		opts, _, optErr := buildOptions(copts, nil)
 		if optErr != nil {
 			return makeError(optErr)
 		}
-		ctx, cancel := context.WithCancel(context.Background())
-		pfs := client.NewPelicanFSWithPrefix(ctx, u.Scheme+"://"+u.Host, opts...)
-		f, err := pfs.OpenFile(u.Path, goFlags)
+		cfile, err := openFile(C.GoString(remoteUrl), goFlags, opts)
 		if err != nil {
-			cancel()
 			return makeError(err)
 		}
-		cfile := C.pelicanc_file_alloc()
-		cfile.handle = C.uintptr_t(cgo.NewHandle(&fileState{file: f, cancel: cancel}))
 		*out = cfile
 		return nil
 	})
@@ -1051,8 +1519,10 @@ func pelicanc_fs_open(remoteUrl *C.char, flags C.int, copts *C.pelican_transfer_
 
 // ioGuard wraps the read/write/seek-style exports: panics become errors,
 // and the (result, error) pair is mapped to the C convention of
-// count-or-negative-one with an optional error out-parameter.
-func ioGuard(errOut **C.pelican_error, fn func() (int64, error)) (ret C.longlong) {
+// count-or-negative-one with an optional error out-parameter.  The file
+// handle is claimed for the duration, so a synchronous call cannot
+// interleave with an asynchronous operation on the same file.
+func ioGuard(cfile *C.pelican_file, errOut **C.pelican_error, fn func(fst *fileState) (int64, error)) (ret C.longlong) {
 	if errOut != nil {
 		*errOut = nil
 	}
@@ -1064,7 +1534,12 @@ func ioGuard(errOut **C.pelican_error, fn func() (int64, error)) (ret C.longlong
 				err = fmt.Errorf("panic in pelican client: %v", r)
 			}
 		}()
-		n, err = fn()
+		fst := fileStateFor(cfile)
+		if err = fst.acquire(); err != nil {
+			return
+		}
+		defer fst.release()
+		n, err = fn(fst)
 	}()
 	if err != nil {
 		if errOut != nil {
@@ -1077,8 +1552,7 @@ func ioGuard(errOut **C.pelican_error, fn func() (int64, error)) (ret C.longlong
 
 //export pelicanc_file_read
 func pelicanc_file_read(cfile *C.pelican_file, buf unsafe.Pointer, length C.size_t, errOut **C.pelican_error) C.longlong {
-	return ioGuard(errOut, func() (int64, error) {
-		st := fileStateFor(cfile)
+	return ioGuard(cfile, errOut, func(st *fileState) (int64, error) {
 		n, err := st.file.Read(unsafe.Slice((*byte)(buf), int(length)))
 		if err == io.EOF && n == 0 {
 			return 0, nil
@@ -1092,8 +1566,7 @@ func pelicanc_file_read(cfile *C.pelican_file, buf unsafe.Pointer, length C.size
 
 //export pelicanc_file_pread
 func pelicanc_file_pread(cfile *C.pelican_file, buf unsafe.Pointer, length C.size_t, offset C.longlong, errOut **C.pelican_error) C.longlong {
-	return ioGuard(errOut, func() (int64, error) {
-		st := fileStateFor(cfile)
+	return ioGuard(cfile, errOut, func(st *fileState) (int64, error) {
 		ra, ok := st.file.(io.ReaderAt)
 		if !ok {
 			return 0, fmt.Errorf("positional reads are not supported for this file")
@@ -1111,8 +1584,7 @@ func pelicanc_file_pread(cfile *C.pelican_file, buf unsafe.Pointer, length C.siz
 
 //export pelicanc_file_write
 func pelicanc_file_write(cfile *C.pelican_file, buf unsafe.Pointer, length C.size_t, errOut **C.pelican_error) C.longlong {
-	return ioGuard(errOut, func() (int64, error) {
-		st := fileStateFor(cfile)
+	return ioGuard(cfile, errOut, func(st *fileState) (int64, error) {
 		w, ok := st.file.(io.Writer)
 		if !ok {
 			return 0, fmt.Errorf("file is not open for writing")
@@ -1127,8 +1599,7 @@ func pelicanc_file_write(cfile *C.pelican_file, buf unsafe.Pointer, length C.siz
 
 //export pelicanc_file_seek
 func pelicanc_file_seek(cfile *C.pelican_file, offset C.longlong, whence C.int, errOut **C.pelican_error) C.longlong {
-	return ioGuard(errOut, func() (int64, error) {
-		st := fileStateFor(cfile)
+	return ioGuard(cfile, errOut, func(st *fileState) (int64, error) {
 		s, ok := st.file.(io.Seeker)
 		if !ok {
 			return 0, fmt.Errorf("seeking is not supported for this file")
@@ -1147,8 +1618,12 @@ func pelicanc_file_stat(cfile *C.pelican_file, cinfo **C.pelican_file_info) *C.p
 			return makeError(fmt.Errorf("output file info pointer may not be NULL"))
 		}
 		*cinfo = nil
-		st := fileStateFor(cfile)
-		info, err := st.file.Stat()
+		fst := fileStateFor(cfile)
+		if err := fst.acquire(); err != nil {
+			return makeError(err)
+		}
+		defer fst.release()
+		info, err := fst.file.Stat()
 		if err != nil {
 			return makeError(err)
 		}
@@ -1164,23 +1639,134 @@ func pelicanc_file_close(cfile *C.pelican_file) *C.pelican_error {
 	if cfile == nil {
 		return nil
 	}
-	var err error
 	if cfile.handle != 0 {
-		h := cgo.Handle(cfile.handle)
-		st := h.Value().(*fileState)
-		func() {
-			defer func() {
-				if r := recover(); r != nil {
-					err = fmt.Errorf("panic in pelican client: %v", r)
-				}
-			}()
-			err = st.file.Close()
-		}()
-		st.cancel()
-		h.Delete()
+		// Claimed and never released: the handle ceases to exist here.
+		if err := fileStateFor(cfile).acquire(); err != nil {
+			return makeError(err)
+		}
 	}
-	C.free(unsafe.Pointer(cfile))
-	return makeError(err)
+	return makeError(closeFileHandle(cfile))
+}
+
+/* ------------------------------------------------------------------ *
+ * Asynchronous file I/O                                              *
+ * ------------------------------------------------------------------ */
+
+// startFileOp claims the file handle, runs fn on a library goroutine,
+// and releases the handle when the operation settles.
+func startFileOp(cfile *C.pelican_file, fn func(fst *fileState) (opResult, error), out **C.pelican_op) *C.pelican_error {
+	if cfile == nil || cfile.handle == 0 {
+		return makeError(fmt.Errorf("file handle may not be NULL"))
+	}
+	fst := fileStateFor(cfile)
+	if err := fst.acquire(); err != nil {
+		return makeError(err)
+	}
+	return startOp(func(context.Context) (opResult, error) {
+		return fn(fst)
+	}, fst.release, out)
+}
+
+//export pelicanc_fs_open_start
+func pelicanc_fs_open_start(remoteUrl *C.char, flags C.int, copts *C.pelican_transfer_opts, out **C.pelican_op) *C.pelican_error {
+	goFlags, err := translateOpenFlags(flags)
+	if err != nil {
+		return makeError(err)
+	}
+	opts, _, optErr := buildOptions(copts, nil)
+	if optErr != nil {
+		return makeError(optErr)
+	}
+	remote := C.GoString(remoteUrl)
+	return startOp(func(context.Context) (opResult, error) {
+		cfile, err := openFile(remote, goFlags, opts)
+		if err != nil {
+			return opResult{}, err
+		}
+		return opResult{kind: opFile, ptr: unsafe.Pointer(cfile)}, nil
+	}, nil, out)
+}
+
+// readIntoC allocates a library-owned C buffer and fills it using read.
+// The buffer belongs to the operation, so nothing the caller owns has to
+// stay alive for the duration of the I/O.
+func readIntoC(length C.size_t, read func(p []byte) (int, error)) (opResult, error) {
+	if length == 0 {
+		return opResult{kind: opData}, nil
+	}
+	buf := C.malloc(length)
+	if buf == nil {
+		return opResult{}, fmt.Errorf("failed to allocate %d bytes for read buffer", int(length))
+	}
+	n, err := read(unsafe.Slice((*byte)(buf), int(length)))
+	if err != nil && err != io.EOF {
+		C.free(buf)
+		return opResult{}, err
+	}
+	if n <= 0 {
+		// End of file: report zero bytes rather than an error.
+		C.free(buf)
+		return opResult{kind: opData}, nil
+	}
+	return opResult{kind: opData, ptr: buf, count: int64(n)}, nil
+}
+
+//export pelicanc_file_read_start
+func pelicanc_file_read_start(cfile *C.pelican_file, length C.size_t, out **C.pelican_op) *C.pelican_error {
+	return startFileOp(cfile, func(fst *fileState) (opResult, error) {
+		return readIntoC(length, fst.file.Read)
+	}, out)
+}
+
+//export pelicanc_file_pread_start
+func pelicanc_file_pread_start(cfile *C.pelican_file, length C.size_t, offset C.longlong, out **C.pelican_op) *C.pelican_error {
+	return startFileOp(cfile, func(fst *fileState) (opResult, error) {
+		ra, ok := fst.file.(io.ReaderAt)
+		if !ok {
+			return opResult{}, fmt.Errorf("positional reads are not supported for this file")
+		}
+		return readIntoC(length, func(p []byte) (int, error) {
+			return ra.ReadAt(p, int64(offset))
+		})
+	}, out)
+}
+
+//export pelicanc_file_write_start
+func pelicanc_file_write_start(cfile *C.pelican_file, buf unsafe.Pointer, length C.size_t, out **C.pelican_op) *C.pelican_error {
+	// Copy the payload up front so the caller may reuse or free its
+	// buffer as soon as this returns.
+	data := C.GoBytes(buf, C.int(length))
+	return startFileOp(cfile, func(fst *fileState) (opResult, error) {
+		w, ok := fst.file.(io.Writer)
+		if !ok {
+			return opResult{}, fmt.Errorf("file is not open for writing")
+		}
+		n, err := w.Write(data)
+		if err != nil {
+			return opResult{}, err
+		}
+		return opResult{kind: opCount, count: int64(n)}, nil
+	}, out)
+}
+
+//export pelicanc_file_close_start
+func pelicanc_file_close_start(cfile *C.pelican_file, out **C.pelican_op) *C.pelican_error {
+	if cfile == nil || cfile.handle == 0 {
+		return makeError(fmt.Errorf("file handle may not be NULL"))
+	}
+	// Claimed and never released: this consumes the handle.
+	if err := fileStateFor(cfile).acquire(); err != nil {
+		return makeError(err)
+	}
+	cerr := startOp(func(context.Context) (opResult, error) {
+		return opResult{}, closeFileHandle(cfile)
+	}, nil, out)
+	if cerr != nil {
+		// The operation never started, so nothing will close the file:
+		// do it here rather than leaking the handle and its engine.
+		_ = closeFileHandle(cfile)
+	}
+	return cerr
 }
 
 // main is required for -buildmode=c-shared; it is never executed.

@@ -36,6 +36,25 @@ jobs:
       - name: Offline smoke test
         run: make test
 
+      # Install into a scratch prefix and build a consumer using only
+      # pkg-config output, so the installed layout and metadata are
+      # exercised rather than just written.
+      - name: Install and consume via pkg-config
+        run: |
+          set -euo pipefail
+          prefix="$PWD/installtest"
+          make install PREFIX="$prefix"
+          export PKG_CONFIG_PATH="$prefix/lib/pkgconfig"
+          pkg-config --exists libpelicanclient
+          cat > /tmp/pcprobe.c <<'EOF'
+          #include <stdio.h>
+          #include <pelican/client.h>
+          int main(void) { printf("%s\n", pelican_version()); return 0; }
+          EOF
+          cc -o /tmp/pcprobe /tmp/pcprobe.c $(pkg-config --cflags --libs libpelicanclient)
+          /tmp/pcprobe
+          make uninstall PREFIX="$prefix"
+
   # Launches a full in-process Pelican federation using the pure-Go
   # serving paths (posixv2 origin, V2 cache), so no XRootD installation
   # is needed, and drives the compiled C library against it.  TLS is

@@ -36,6 +36,11 @@ struct pelican_file {
     uintptr_t handle;
 };
 
+struct pelican_op {
+    uintptr_t handle;
+    int       notify_fd; /* read end of the wakeup pipe */
+};
+
 struct pelican_transfer_opts {
     char *token;
     char *token_location;
@@ -102,5 +107,6 @@ pelican_file_info_list *pelicanc_file_info_list_alloc(size_t n);
 struct pelican_context *pelicanc_context_alloc(void);
 struct pelican_transfer *pelicanc_transfer_alloc(void);
 struct pelican_file *pelicanc_file_alloc(void);
+struct pelican_op *pelicanc_op_alloc(void);
 
 #endif /* PELICAN_C_BRIDGE_H */

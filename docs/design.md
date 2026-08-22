@@ -69,6 +69,41 @@ is safe — free marks the state, releases queued C memory, and closes the
 pipe under the mutex; subsequent producer events free their payload
 immediately instead of enqueueing, and never touch the closed fds.
 
+## Single-shot asynchronous operations
+
+Everything that is not a multi-object transfer — the namespace calls,
+cache management, and file I/O — has a `*_start` form returning a
+`pelican_op`. One generic handle serves them all: the state holds a
+notification pipe, a completion flag, an error, and a kind-tagged
+result, and each `*_start` hands `startOp` a closure to run on a library
+goroutine. Typed `pelican_op_take_*` functions transfer ownership of the
+result and refuse a mismatched kind, so the tag replaces what would
+otherwise be a per-operation handle type.
+
+The pipe discipline differs from transfers: an operation completes once,
+so its wake byte is written once and never drained, leaving the fd
+permanently readable. That is the correct level-triggered signal for
+"this operation is finished" and needs no drain handshake.
+
+Uncollected results are released by `pelican_op_free` — including an
+open() result, which owns a live PelicanFS and must be *closed* rather
+than freed. Freeing an in-flight operation is safe: it marks the state,
+and the goroutine discards its result on completion.
+
+Two ordering rules matter. Options are translated on the caller's thread
+before `*_start` returns, so the caller may free its options immediately;
+and asynchronous writes copy their payload up front, while reads
+allocate a library-owned buffer, so no caller memory is touched after
+the call returns. This is deliberately unlike POSIX `aio`, where a
+caller-supplied buffer must outlive the request — a footgun not worth
+handing to a single-threaded daemon.
+
+Because a `PelicanFile` shares a position and a pipe, each handle admits
+only one operation at a time. `fileState` tracks that with a busy flag
+claimed by every call, synchronous or asynchronous; the flag is released
+*before* completion is published, so a host woken by the notification fd
+can immediately start the next operation without being told it is busy.
+
 ## File I/O (PelicanFS)
 
 `pelican_fs_open` splits the URL into a federation prefix and object
@@ -167,8 +202,23 @@ unless the list ends with the sentinel `"+"`, which appends the
 director's servers; the integration test pins down all three behaviors
 (honored, exclusive without `+`, fallback with `+`).
 
+## Packaging
+
+The shared library carries an soname (`libpelicanclient.so.$ABI` on
+Linux, a versioned install name on macOS), so an incompatible future
+release can be installed alongside this one; `ABI_VERSION` in the
+Makefile is bumped only for a breaking change to `client.h`, not for
+added functions. Builds keep an `@rpath` install name so the library
+works straight from the build tree, and `make install` rewrites it to the
+absolute libdir — which requires linking with
+`-headerpad_max_install_names` on macOS, or the rewrite fails for any
+path longer than the original. `make install` also emits a pkg-config
+file; because its contents derive from command-line variables rather
+than files, it is regenerated unconditionally.
+
 ## Roadmap ideas
 
-- Async variants of stat/list and non-blocking file I/O (read request +
-  notification-fd completion), if DaemonCore ends up needing them.
-- pkg-config file + install target.
+- Bind the streaming transfer engine's job-level knobs (synchronize
+  levels, byte ranges, dry run) if a caller needs them.
+- Windows support, which needs a notification primitive other than a
+  pipe (the async API is otherwise portable).

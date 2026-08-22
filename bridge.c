@@ -91,6 +91,12 @@ pelicanc_file_alloc(void)
     return calloc(1, sizeof(struct pelican_file));
 }
 
+struct pelican_op *
+pelicanc_op_alloc(void)
+{
+    return calloc(1, sizeof(struct pelican_op));
+}
+
 /* ------------------------------------------------------------------ *
  * Errors                                                             *
  * ------------------------------------------------------------------ */
@@ -466,6 +472,88 @@ pelican_transfer_free(pelican_transfer *xfer)
 }
 
 /* ------------------------------------------------------------------ *
+ * Asynchronous operation accessors                                   *
+ * ------------------------------------------------------------------ */
+
+int
+pelican_op_notify_fd(const pelican_op *op)
+{
+    return op->notify_fd;
+}
+
+int
+pelican_op_is_done(const pelican_op *op)
+{
+    return pelicanc_op_is_done((pelican_op *)op);
+}
+
+const pelican_error *
+pelican_op_error(const pelican_op *op)
+{
+    return pelicanc_op_error((pelican_op *)op);
+}
+
+void
+pelican_op_cancel(pelican_op *op)
+{
+    pelicanc_op_cancel(op);
+}
+
+void
+pelican_op_free(pelican_op *op)
+{
+    pelicanc_op_free(op);
+}
+
+int
+pelican_op_take_file_info(pelican_op *op, pelican_file_info **info)
+{
+    return pelicanc_op_take_file_info(op, info);
+}
+
+int
+pelican_op_take_file_info_list(pelican_op *op, pelican_file_info_list **entries)
+{
+    return pelicanc_op_take_file_info_list(op, entries);
+}
+
+int
+pelican_op_take_file(pelican_op *op, pelican_file **file)
+{
+    return pelicanc_op_take_file(op, file);
+}
+
+int
+pelican_op_take_count(pelican_op *op, long long *count)
+{
+    return pelicanc_op_take_count(op, count);
+}
+
+int
+pelican_op_take_data(pelican_op *op, void **buf, size_t *len)
+{
+    return pelicanc_op_take_data(op, buf, len);
+}
+
+int
+pelican_op_take_cache_info(pelican_op *op, long long *age_s, long long *size)
+{
+    return pelicanc_op_take_cache_info(op, age_s, size);
+}
+
+int
+pelican_op_take_message(pelican_op *op, char **message)
+{
+    return pelicanc_op_take_message(op, message);
+}
+
+void
+pelican_buffer_free(void *buf)
+{
+    free(buf);
+}
+
+/* ------------------------------------------------------------------ *
  * Forwarders into the Go implementation                              *
  * ------------------------------------------------------------------ */
 
@@ -672,4 +760,82 @@ pelican_error *
 pelican_file_close(pelican_file *file)
 {
     return pelicanc_file_close(file);
+}
+
+/* ------------------------------------------------------------------ *
+ * Asynchronous operation forwarders                                  *
+ * ------------------------------------------------------------------ */
+
+pelican_error *
+pelican_stat_start(const char *remote_url, const pelican_transfer_opts *opts,
+                   pelican_op **op)
+{
+    return pelicanc_stat_start((char *)remote_url,
+                               (pelican_transfer_opts *)opts, op);
+}
+
+pelican_error *
+pelican_list_start(const char *remote_url, const pelican_transfer_opts *opts,
+                   pelican_op **op)
+{
+    return pelicanc_list_start((char *)remote_url,
+                               (pelican_transfer_opts *)opts, op);
+}
+
+pelican_error *
+pelican_delete_start(const char *remote_url,
+                     const pelican_transfer_opts *opts, pelican_op **op)
+{
+    return pelicanc_delete_start((char *)remote_url,
+                                 (pelican_transfer_opts *)opts, op);
+}
+
+pelican_error *
+pelican_cache_info_start(const char *remote_url,
+                         const pelican_transfer_opts *opts, pelican_op **op)
+{
+    return pelicanc_cache_info_start((char *)remote_url,
+                                     (pelican_transfer_opts *)opts, op);
+}
+
+pelican_error *
+pelican_evict_start(const char *remote_url, int immediate,
+                    const pelican_transfer_opts *opts, pelican_op **op)
+{
+    return pelicanc_evict_start((char *)remote_url, immediate,
+                                (pelican_transfer_opts *)opts, op);
+}
+
+pelican_error *
+pelican_fs_open_start(const char *remote_url, int flags,
+                      const pelican_transfer_opts *opts, pelican_op **op)
+{
+    return pelicanc_fs_open_start((char *)remote_url, flags,
+                                  (pelican_transfer_opts *)opts, op);
+}
+
+pelican_error *
+pelican_file_read_start(pelican_file *file, size_t len, pelican_op **op)
+{
+    return pelicanc_file_read_start(file, len, op);
+}
+
+pelican_error *
+pelican_file_pread_start(pelican_file *file, size_t len, long long offset,
+                         pelican_op **op)
+{
+    return pelicanc_file_pread_start(file, len, offset, op);
+}
+
+pelican_error *
+pelican_file_write_start(pelican_file *file, const void *buf, size_t len,
+                         pelican_op **op)
+{
+    return pelicanc_file_write_start(file, (void *)buf, len, op);
+}
+
+pelican_error *
+pelican_file_close_start(pelican_file *file, pelican_op **op)
+{
+    return pelicanc_file_close_start(file, op);
 }
