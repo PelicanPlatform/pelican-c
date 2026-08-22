@@ -148,6 +148,30 @@ void pelican_transfer_opts_set_progress(pelican_transfer_opts *opts,
                                         pelican_progress_fn fn,
                                         void *user_data);
 
+/**
+ * Add a preferred cache to try before the director's ordering (e.g.
+ * "https://cache.example.com:8443").  May be called repeatedly; order is
+ * preserved.  By default ONLY the listed caches are tried; add the
+ * special value "+" as the final entry to fall back to the director's
+ * list after the explicit preferences.  Invalid URLs are reported by
+ * the operation the options are passed to.
+ */
+void pelican_transfer_opts_add_cache(pelican_transfer_opts *opts,
+                                     const char *cache_url);
+
+/**
+ * Ask the server to provide a checksum of the given type (HTTP digest
+ * name: "md5", "crc32c", "crc32", or "sha").  May be called repeatedly.
+ * Unknown names are reported by the operation the options are passed to.
+ */
+void pelican_transfer_opts_add_checksum_request(pelican_transfer_opts *opts,
+                                                const char *digest_name);
+
+/** Nonzero to fail the transfer if checksum verification cannot be
+ *  performed (rather than transferring unverified). */
+void pelican_transfer_opts_set_require_checksum(pelican_transfer_opts *opts,
+                                                int require);
+
 /* For third-party copies, the source and destination may need different
  * credentials; these override the plain token/token_location for the
  * respective side.  (All values copied; NULL clears.) */

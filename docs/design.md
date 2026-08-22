@@ -151,14 +151,24 @@ PelicanFS file I/O are synchronous.  Results carry the server ETag and
 checksums (server-reported, falling back to client-computed), hex-encoded
 with HTTP digest names.
 
-Deliberately not exposed: interactive token acquisition (the library is
-always non-interactive), sharing-URL creation, shadow ingest, and the
-`object sync` synchronization semantics.
+Transfer behavior knobs cover preferred caches and checksum requests
+(see below).  Deliberately not exposed: interactive token acquisition
+(the library is always non-interactive), sharing-URL creation, shadow
+ingest, and the `object sync` synchronization semantics.
+
+Preferred caches and checksum requests are list-valued options, appended
+one at a time (`pelican_transfer_opts_add_cache`,
+`..._add_checksum_request`) so the ABI needs no array-passing convention.
+Because the setters are plain C they cannot validate, so `buildOptions`
+does: an unparseable cache URL or unknown digest name surfaces as an
+error from the operation the options are handed to. Preferred caches
+follow the client's own semantics — only the listed caches are tried
+unless the list ends with the sentinel `"+"`, which appends the
+director's servers; the integration test pins down all three behaviors
+(honored, exclusive without `+`, fallback with `+`).
 
 ## Roadmap ideas
 
 - Async variants of stat/list and non-blocking file I/O (read request +
   notification-fd completion), if DaemonCore ends up needing them.
-- Preferred-cache selection (`WithCaches`) and checksum-request knobs
-  (`WithRequestChecksums` / `WithRequireChecksum`) in the options object.
 - pkg-config file + install target.

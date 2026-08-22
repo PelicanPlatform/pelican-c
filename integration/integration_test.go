@@ -33,7 +33,9 @@ package integration
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
 	_ "embed"
+	"encoding/hex"
 	"fmt"
 	"net/url"
 	"os"
@@ -80,6 +82,18 @@ func runDriver(t *testing.T, driver string, env []string, args ...string) (strin
 	t.Logf("driver %v: exit=%d\nstdout:\n%s\nstderr:\n%s", args, exitCode,
 		stdout.String(), stderr.String())
 	return stdout.String(), stderr.String(), exitCode
+}
+
+// findValue returns the value of the first `key<value>` line in the
+// driver's output, or "" if absent.
+func findValue(t *testing.T, output, key string) string {
+	t.Helper()
+	for _, line := range strings.Split(output, "\n") {
+		if after, ok := strings.CutPrefix(strings.TrimSpace(line), key); ok {
+			return after
+		}
+	}
+	return ""
 }
 
 func TestCClientFederation(t *testing.T) {
@@ -180,6 +194,74 @@ func TestCClientFederation(t *testing.T) {
 		content, err := os.ReadFile(dest)
 		require.NoError(t, err)
 		assert.Equal(t, helloContent, string(content))
+	})
+
+	t.Run("checksum-request", func(t *testing.T) {
+		dest := filepath.Join(downloads, "checksummed.txt")
+		stdout, _, code := runDriver(t, driver, env, "get", objectUrl("hello_world.txt"), dest,
+			"checksum=md5", "require-checksum")
+		require.Equal(t, 0, code)
+		wantMd5 := md5.Sum([]byte(helloContent))
+		assert.Contains(t, stdout, "checksum=md5:"+hex.EncodeToString(wantMd5[:]))
+	})
+
+	t.Run("checksum-unknown-digest", func(t *testing.T) {
+		dest := filepath.Join(downloads, "never-written.txt")
+		_, stderr, code := runDriver(t, driver, env, "get", objectUrl("hello_world.txt"), dest,
+			"checksum=bogus-digest")
+		require.NotEqual(t, 0, code)
+		assert.Contains(t, stderr, "unknown checksum digest")
+	})
+
+	// Preferred-cache selection: by default only the listed caches are
+	// tried; a trailing "+" falls back to the director's list.  The
+	// endpoint to prefer is discovered from an ordinary transfer rather
+	// than assumed, because Cache.Url in this federation carries a path
+	// prefix (/api/v1.0/cache/data/...) that preferred-cache handling
+	// does not preserve.
+	t.Run("preferred-cache", func(t *testing.T) {
+		object := objectUrl("hello_world.txt")
+
+		stdout, _, code := runDriver(t, driver, env, "get", object,
+			filepath.Join(downloads, "discover.txt"))
+		require.Equal(t, 0, code)
+		endpoint := findValue(t, stdout, "endpoint=")
+		require.NotEmpty(t, endpoint, "transfer did not report an endpoint")
+
+		t.Run("honored", func(t *testing.T) {
+			dest := filepath.Join(downloads, "via-preferred.txt")
+			stdout, _, code := runDriver(t, driver, env, "get", object, dest,
+				"cache=https://"+endpoint)
+			require.Equal(t, 0, code)
+			assert.Contains(t, stdout, "endpoint="+endpoint)
+			content, err := os.ReadFile(dest)
+			require.NoError(t, err)
+			assert.Equal(t, helloContent, string(content))
+		})
+
+		// 127.0.0.1:1 refuses connections, so a transfer that only has
+		// this cache to work with must fail: no silent fallback to the
+		// director's servers.
+		t.Run("exclusive-without-plus", func(t *testing.T) {
+			_, stderr, code := runDriver(t, driver, env, "get", object,
+				filepath.Join(downloads, "never-written-2.txt"),
+				"cache=https://127.0.0.1:1")
+			require.NotEqual(t, 0, code)
+			assert.Contains(t, stderr, "get failed")
+			assert.NotContains(t, stderr, endpoint,
+				"director-provided endpoint was tried despite no '+' fallback")
+		})
+
+		t.Run("plus-falls-back", func(t *testing.T) {
+			dest := filepath.Join(downloads, "via-fallback.txt")
+			stdout, _, code := runDriver(t, driver, env, "get", object, dest,
+				"cache=https://127.0.0.1:1", "cache=+")
+			require.Equal(t, 0, code)
+			assert.Contains(t, stdout, "endpoint="+endpoint)
+			content, err := os.ReadFile(dest)
+			require.NoError(t, err)
+			assert.Equal(t, helloContent, string(content))
+		})
 	})
 
 	t.Run("fs-read", func(t *testing.T) {

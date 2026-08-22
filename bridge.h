@@ -44,6 +44,11 @@ struct pelican_transfer_opts {
     char *dest_token;
     char *dest_token_location;
     int   recursive;
+    int   require_checksum;
+    char **caches;
+    size_t n_caches;
+    char **checksum_requests;
+    size_t n_checksum_requests;
     pelican_progress_fn progress;
     void *progress_data;
 };

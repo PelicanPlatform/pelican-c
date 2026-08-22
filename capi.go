@@ -140,14 +140,44 @@ func invokeProgress(fn C.pelican_progress_fn, userData unsafe.Pointer, path stri
 }
 
 // buildOptions translates the C options struct into client.TransferOption
-// values.  The library always runs non-interactively: it must never block
-// the host process on an OAuth device-flow prompt.  If sink is non-nil,
+// values, validating values whose setters (being plain C) could not.
+// The library always runs non-interactively: it must never block the
+// host process on an OAuth device-flow prompt.  If sink is non-nil,
 // progress reports are handed to it instead of invoking the C callback
 // from a library thread.
-func buildOptions(copts *C.pelican_transfer_opts, sink progressSink) (opts []client.TransferOption, recursive bool) {
+func buildOptions(copts *C.pelican_transfer_opts, sink progressSink) (opts []client.TransferOption, recursive bool, err error) {
 	opts = append(opts, client.WithNonInteractive(true))
 	if copts == nil {
 		return
+	}
+	if copts.n_caches > 0 {
+		names := unsafe.Slice(copts.caches, copts.n_caches)
+		caches := make([]*url.URL, 0, len(names))
+		for _, name := range names {
+			cacheStr := C.GoString(name)
+			cacheUrl, parseErr := url.Parse(cacheStr)
+			if parseErr != nil {
+				return nil, false, fmt.Errorf("invalid preferred cache URL %q: %w", cacheStr, parseErr)
+			}
+			caches = append(caches, cacheUrl)
+		}
+		opts = append(opts, client.WithCaches(caches...))
+	}
+	if copts.n_checksum_requests > 0 {
+		names := unsafe.Slice(copts.checksum_requests, copts.n_checksum_requests)
+		types := make([]client.ChecksumType, 0, len(names))
+		for _, name := range names {
+			digest := C.GoString(name)
+			ctype := client.ChecksumFromHttpDigest(digest)
+			if ctype == client.AlgUnknown {
+				return nil, false, fmt.Errorf("unknown checksum digest %q; known digests: %v", digest, client.KnownChecksumTypesAsHttpDigest())
+			}
+			types = append(types, ctype)
+		}
+		opts = append(opts, client.WithRequestChecksums(types))
+	}
+	if copts.require_checksum != 0 {
+		opts = append(opts, client.WithRequireChecksum())
 	}
 	if copts.token != nil {
 		opts = append(opts, client.WithToken(C.GoString(copts.token)))
@@ -357,7 +387,10 @@ func pelicanc_get(cctx *C.pelican_context, remoteUrl, localPath *C.char, copts *
 		if err := requireInit(); err != nil {
 			return makeError(err)
 		}
-		opts, recursive := buildOptions(copts, nil)
+		opts, recursive, optErr := buildOptions(copts, nil)
+		if optErr != nil {
+			return makeError(optErr)
+		}
 		remote := C.GoString(remoteUrl)
 		results, err := client.DoGet(goCtxFor(cctx), remote, C.GoString(localPath), recursive, opts...)
 		if listOut != nil {
@@ -373,7 +406,10 @@ func pelicanc_put(cctx *C.pelican_context, localPath, remoteUrl *C.char, copts *
 		if err := requireInit(); err != nil {
 			return makeError(err)
 		}
-		opts, recursive := buildOptions(copts, nil)
+		opts, recursive, optErr := buildOptions(copts, nil)
+		if optErr != nil {
+			return makeError(optErr)
+		}
 		remote := C.GoString(remoteUrl)
 		results, err := client.DoPut(goCtxFor(cctx), C.GoString(localPath), remote, recursive, opts...)
 		if listOut != nil {
@@ -606,7 +642,10 @@ func runSyncEngineJob(cctx *C.pelican_context, kind xferKind, a, b string, copts
 		if err != nil {
 			return makeError(fmt.Errorf("failed to start transfer engine: %w", err))
 		}
-		opts, recursive := buildOptions(copts, nil)
+		opts, recursive, optErr := buildOptions(copts, nil)
+		if optErr != nil {
+			return makeError(optErr)
+		}
 		tc, err := te.NewClient(opts...)
 		if err != nil {
 			return makeError(err)
@@ -669,10 +708,16 @@ func startTransfer(kind xferKind, a, b string, copts *C.pelican_transfer_opts, o
 			ts.progressData = copts.progress_data
 			sink = ts.enqueueProgress
 		}
+		opts, recursive, optErr := buildOptions(copts, sink)
+		if optErr != nil {
+			cancel()
+			_ = syscall.Close(fds[0])
+			_ = syscall.Close(fds[1])
+			return makeError(optErr)
+		}
 		cxfer := C.pelicanc_transfer_alloc()
 		cxfer.handle = C.uintptr_t(cgo.NewHandle(ts))
 		cxfer.notify_fd = C.int(fds[0])
-		opts, recursive := buildOptions(copts, sink)
 		go runTransfer(ctx, ts, te, kind, a, b, recursive, opts)
 		*out = cxfer
 		return nil
@@ -715,7 +760,10 @@ func pelicanc_cache_info(cctx *C.pelican_context, remoteUrl *C.char, copts *C.pe
 		if err := requireInit(); err != nil {
 			return makeError(err)
 		}
-		opts, _ := buildOptions(copts, nil)
+		opts, _, optErr := buildOptions(copts, nil)
+		if optErr != nil {
+			return makeError(optErr)
+		}
 		age, size, err := client.DoCacheInfo(goCtxFor(cctx), C.GoString(remoteUrl), opts...)
 		if err != nil {
 			return makeError(err)
@@ -739,7 +787,10 @@ func pelicanc_evict(cctx *C.pelican_context, remoteUrl *C.char, immediate C.int,
 		if messageOut != nil {
 			*messageOut = nil
 		}
-		opts, _ := buildOptions(copts, nil)
+		opts, _, optErr := buildOptions(copts, nil)
+		if optErr != nil {
+			return makeError(optErr)
+		}
 		message, err := client.DoEvict(goCtxFor(cctx), C.GoString(remoteUrl), immediate != 0, opts...)
 		if err != nil {
 			return makeError(err)
@@ -858,7 +909,10 @@ func pelicanc_stat(cctx *C.pelican_context, remoteUrl *C.char, copts *C.pelican_
 			return makeError(fmt.Errorf("output file info pointer may not be NULL"))
 		}
 		*cinfo = nil
-		opts, _ := buildOptions(copts, nil)
+		opts, _, optErr := buildOptions(copts, nil)
+		if optErr != nil {
+			return makeError(optErr)
+		}
 		info, err := client.DoStat(goCtxFor(cctx), C.GoString(remoteUrl), opts...)
 		if err != nil {
 			return makeError(err)
@@ -880,7 +934,10 @@ func pelicanc_list(cctx *C.pelican_context, remoteUrl *C.char, copts *C.pelican_
 			return makeError(fmt.Errorf("output list pointer may not be NULL"))
 		}
 		*listOut = nil
-		opts, _ := buildOptions(copts, nil)
+		opts, _, optErr := buildOptions(copts, nil)
+		if optErr != nil {
+			return makeError(optErr)
+		}
 		infos, err := client.DoList(goCtxFor(cctx), C.GoString(remoteUrl), opts...)
 		if err != nil {
 			return makeError(err)
@@ -905,7 +962,10 @@ func pelicanc_delete(cctx *C.pelican_context, remoteUrl *C.char, copts *C.pelica
 		if err := requireInit(); err != nil {
 			return makeError(err)
 		}
-		opts, recursive := buildOptions(copts, nil)
+		opts, recursive, optErr := buildOptions(copts, nil)
+		if optErr != nil {
+			return makeError(optErr)
+		}
 		return makeError(client.DoDelete(goCtxFor(cctx), C.GoString(remoteUrl), recursive, opts...))
 	})
 }
@@ -971,7 +1031,10 @@ func pelicanc_fs_open(remoteUrl *C.char, flags C.int, copts *C.pelican_transfer_
 		if u.Scheme == "" || u.Host == "" {
 			return makeError(fmt.Errorf("remote URL %q must include a scheme and federation host (e.g. pelican://federation/path)", u.String()))
 		}
-		opts, _ := buildOptions(copts, nil)
+		opts, _, optErr := buildOptions(copts, nil)
+		if optErr != nil {
+			return makeError(optErr)
+		}
 		ctx, cancel := context.WithCancel(context.Background())
 		pfs := client.NewPelicanFSWithPrefix(ctx, u.Scheme+"://"+u.Host, opts...)
 		f, err := pfs.OpenFile(u.Path, goFlags)

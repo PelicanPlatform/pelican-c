@@ -109,7 +109,7 @@ notification-fd protocol, and API conventions.
 | Area | Functions |
 | --- | --- |
 | Setup | `pelican_client_init`, `pelican_config_set`, `pelican_version` |
-| Options | `pelican_transfer_opts_new/_free`, `..._set_token(_location)`, `..._set_source_token(_location)`, `..._set_destination_token(_location)`, `..._set_recursive`, `..._set_progress` |
+| Options | `pelican_transfer_opts_new/_free`, `..._set_token(_location)`, `..._set_source_token(_location)`, `..._set_destination_token(_location)`, `..._set_recursive`, `..._set_progress`, `..._add_cache`, `..._add_checksum_request`, `..._set_require_checksum` |
 | Sync transfers | `pelican_get`, `pelican_put`, `pelican_copy` (third-party copy), `pelican_prestage` (+ `pelican_result_list_*` accessors) |
 | Async transfers | `pelican_get_start`, `pelican_put_start`, `pelican_copy_start`, `pelican_prestage_start`, `pelican_transfer_notify_fd`, `..._next_result`, `..._is_done`, `..._error`, `..._cancel`, `..._free` |
 | Results | `pelican_result_source/_transferred_bytes/_endpoint/_transfer_time_s/_attempts/_error/_etag/_checksum_*` |

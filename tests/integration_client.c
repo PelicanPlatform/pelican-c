@@ -6,12 +6,15 @@
  *
  *   integration_client stat      <url>
  *   integration_client list      <url>
- *   integration_client get       <url> <local-path>
+ *   integration_client get       <url> <local-path> [opt...]
  *   integration_client get-async <url> <local-path>
  *   integration_client put       <local-path> <url>
  *   integration_client copy      <source-url> <dest-url>
  *   integration_client fs-read   <url>
  *   integration_client delete    <url>
+ *
+ * Trailing [opt...] arguments for get: "checksum=<digest>",
+ * "cache=<url>", "require-checksum".
  *
  * Output is line-oriented `key=value` pairs on stdout for the test
  * harness to assert on.  get-async additionally verifies the async-mode
@@ -86,6 +89,8 @@ report_results(pelican_result_list *results)
         } else {
             printf("object=%s bytes=%lld\n", pelican_result_source(r),
                    pelican_result_transferred_bytes(r));
+            if (pelican_result_endpoint(r) != NULL)
+                printf("endpoint=%s\n", pelican_result_endpoint(r));
             if (pelican_result_etag(r) != NULL)
                 printf("etag=%s\n", pelican_result_etag(r));
             for (size_t c = 0; c < pelican_result_checksum_count(r); c++)
@@ -99,10 +104,34 @@ report_results(pelican_result_list *results)
 }
 
 static int
-cmd_get(const char *url, const char *local_path)
+apply_opt_args(pelican_transfer_opts *opts, int argc, char **argv, int start)
 {
+    for (int i = start; i < argc; i++) {
+        if (strncmp(argv[i], "checksum=", 9) == 0)
+            pelican_transfer_opts_add_checksum_request(opts, argv[i] + 9);
+        else if (strncmp(argv[i], "cache=", 6) == 0)
+            pelican_transfer_opts_add_cache(opts, argv[i] + 6);
+        else if (strcmp(argv[i], "require-checksum") == 0)
+            pelican_transfer_opts_set_require_checksum(opts, 1);
+        else {
+            fprintf(stderr, "unknown option argument: %s\n", argv[i]);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int
+cmd_get(const char *url, const char *local_path, int argc, char **argv)
+{
+    pelican_transfer_opts *opts = pelican_transfer_opts_new();
+    if (apply_opt_args(opts, argc, argv, 4) != 0) {
+        pelican_transfer_opts_free(opts);
+        return 2;
+    }
     pelican_result_list *results = NULL;
-    pelican_error *err = pelican_get(NULL, url, local_path, NULL, &results);
+    pelican_error *err = pelican_get(NULL, url, local_path, opts, &results);
+    pelican_transfer_opts_free(opts);
     if (err != NULL)
         return fail("get", err);
     return report_results(results) ? 1 : 0;
@@ -264,7 +293,7 @@ main(int argc, char **argv)
     if (strcmp(cmd, "list") == 0)
         return cmd_list(argv[2]);
     if (strcmp(cmd, "get") == 0 && argc >= 4)
-        return cmd_get(argv[2], argv[3]);
+        return cmd_get(argv[2], argv[3], argc, argv);
     if (strcmp(cmd, "get-async") == 0 && argc >= 4)
         return cmd_get_async(argv[2], argv[3]);
     if (strcmp(cmd, "put") == 0 && argc >= 4)

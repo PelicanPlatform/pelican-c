@@ -132,6 +132,15 @@ pelican_transfer_opts_new(void)
     return calloc(1, sizeof(pelican_transfer_opts));
 }
 
+static void
+free_string_list(char **list, size_t n)
+{
+    size_t i;
+    for (i = 0; i < n; i++)
+        free(list[i]);
+    free(list);
+}
+
 void
 pelican_transfer_opts_free(pelican_transfer_opts *opts)
 {
@@ -143,7 +152,24 @@ pelican_transfer_opts_free(pelican_transfer_opts *opts)
     free(opts->source_token_location);
     free(opts->dest_token);
     free(opts->dest_token_location);
+    free_string_list(opts->caches, opts->n_caches);
+    free_string_list(opts->checksum_requests, opts->n_checksum_requests);
     free(opts);
+}
+
+static void
+append_string(char ***list, size_t *n, const char *value)
+{
+    char **grown;
+    if (!value)
+        return;
+    grown = realloc(*list, (*n + 1) * sizeof(char *));
+    if (!grown)
+        return;
+    *list = grown;
+    (*list)[*n] = strdup(value);
+    if ((*list)[*n])
+        (*n)++;
 }
 
 static void
@@ -165,6 +191,28 @@ pelican_transfer_opts_set_token_location(pelican_transfer_opts *opts,
                                          const char *path)
 {
     set_string_field(&opts->token_location, path);
+}
+
+void
+pelican_transfer_opts_add_cache(pelican_transfer_opts *opts,
+                                const char *cache_url)
+{
+    append_string(&opts->caches, &opts->n_caches, cache_url);
+}
+
+void
+pelican_transfer_opts_add_checksum_request(pelican_transfer_opts *opts,
+                                           const char *digest_name)
+{
+    append_string(&opts->checksum_requests, &opts->n_checksum_requests,
+                  digest_name);
+}
+
+void
+pelican_transfer_opts_set_require_checksum(pelican_transfer_opts *opts,
+                                           int require)
+{
+    opts->require_checksum = require;
 }
 
 void
