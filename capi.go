@@ -1643,6 +1643,26 @@ func fileStateFor(cfile *C.pelican_file) *fileState {
 	return cgo.Handle(cfile.handle).Value().(*fileState)
 }
 
+// splitRemoteForFS splits a remote URL into the prefix a PelicanFS is
+// built with and the name OpenFile is then given.
+//
+// The two must concatenate back into the URL that came in, because
+// that is literally what OpenFile does with them: it joins them and
+// parses the result as a URL again.  So the name has to stay in URL
+// form, which is why this returns EscapedPath and not Path.  Handing
+// back the decoded Path is not merely lossy -- "a%25b" comes back as
+// "a%b" and fails to parse, and "a%23b" comes back as "a#b", which
+// parses *successfully* into a different object with a fragment.
+//
+// This is the only place in the C API that takes a remote URL apart;
+// every other entry point passes the caller's string through to the
+// client untouched.  Keep it that way, and keep the round trip under
+// test (TestSplitRemoteForFSRoundTrips), rather than open-coding the
+// split at a second call site.
+func splitRemoteForFS(u *url.URL) (prefix, name string) {
+	return u.Scheme + "://" + u.Host, u.EscapedPath()
+}
+
 // openFile performs the blocking open, shared by the synchronous and
 // asynchronous entry points.
 func openFile(remote string, goFlags int, opts []client.TransferOption) (*C.pelican_file, error) {
@@ -1654,8 +1674,9 @@ func openFile(remote string, goFlags int, opts []client.TransferOption) (*C.peli
 		return nil, fmt.Errorf("remote URL %q must include a scheme and federation host (e.g. pelican://federation/path)", u.String())
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	pfs := client.NewPelicanFSWithPrefix(ctx, u.Scheme+"://"+u.Host, opts...)
-	f, err := pfs.OpenFile(u.Path, goFlags)
+	prefix, name := splitRemoteForFS(u)
+	pfs := client.NewPelicanFSWithPrefix(ctx, prefix, opts...)
+	f, err := pfs.OpenFile(name, goFlags)
 	if err != nil {
 		cancel()
 		return nil, err
